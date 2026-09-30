@@ -242,9 +242,10 @@ function _getConfig() {
  */
 function resolveThresholds(tenantId) {
   const { defaults, tenants } = _getConfig();
+  const tenantKey = tenantId === undefined || tenantId === null ? null : String(tenantId);
 
-  if (tenantId !== undefined && tenantId !== null && tenants.has(String(tenantId))) {
-    return { ...tenants.get(String(tenantId)) };
+  if (tenantKey !== null && tenants.has(tenantKey)) {
+    return { ...tenants.get(tenantKey) };
   }
 
   return { ...defaults };
