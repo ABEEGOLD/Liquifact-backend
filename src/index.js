@@ -18,6 +18,16 @@ const { validate, logRedactedSummary } = require('./config');
 const shutdownCoordinator = require('./utils/shutdownCoordinator');
 
 /**
+ * Module-level startup state guards to prevent concurrent/duplicate initialization.
+ * @type {{ isServerStarted: boolean, serverInstance: import('http').Server|null, fencingTokens: Map<string, string> }}
+ */
+const startupState = {
+  isServerStarted: false,
+  serverInstance: null,
+  fencingTokens: new Map(),
+};
+
+/**
  * Runs the S3 connectivity probe at startup. Failures are logged but never
  * block process start - the readiness probe (`/readyz`) surfaces storage
  * misconfiguration to orchestrators once the HTTP server is listening.
@@ -57,15 +67,25 @@ function runBootConfigValidation() {
 
 /**
  * Starts the HTTP server on the configured port.
+ * Idempotent: if already started, returns the existing server instance.
  *
  * @returns {$import('http').Server} The HTTP server instance.
  */
 function startServer() {
+  if (startupState.isServerStarted && startupState.serverInstance) {
+    console.warn('[index] startServer called multiple times; returning existing server instance');
+    return startupState.serverInstance;
+  }
+
   runBootConfigValidation();
   const port = process.env.PORT || 3001;
   // Fire-and-forget probe -- do not await, so startup is not blocked.
   scheduleStartupStorageProbe();
   const server = app.listen(port);
+  
+  startupState.isServerStarted = true;
+  startupState.serverInstance = server;
+  
   shutdownCoordinator.register({ server });
   shutdownCoordinator.setupSignalListeners();
   return server;
@@ -92,6 +112,27 @@ function resetStore() {
   }
 }
 
+/**
+ * Gets the fencing token for a specific worker type.
+ * Used by workers to validate their lease fencing.
+ *
+ * @param {string} workerType - The worker type (e.g., 'idempotencyPurge', 'invoiceStatePurge')
+ * @returns {string|undefined} The fencing token, or undefined if not set
+ */
+function getFencingToken(workerType) {
+  return startupState.fencingTokens.get(workerType);
+}
+
+/**
+ * Resets startup state for test isolation.
+ * @private
+ */
+function _resetStartupState() {
+  startupState.isServerStarted = false;
+  startupState.serverInstance = null;
+  startupState.fencingTokens.clear();
+}
+
 const originalCreateApp = app.createApp;
 
 /**
@@ -105,15 +146,22 @@ function createApp() {
 
 // Start background workers when running as main module (not in tests)
 if (process.env.NODE_ENV !== 'test' && require.main === module) {
+  // Generate and store fencing tokens for lease fencing
+  const idempotencyFencingToken = crypto.randomUUID();
+  const invoiceStateFencingToken = crypto.randomUUID();
+  
+  startupState.fencingTokens.set('idempotencyPurge', idempotencyFencingToken);
+  startupState.fencingTokens.set('invoiceStatePurge', invoiceStateFencingToken);
+
   // Start the idempotency purge worker with a fresh fencing token so that stale
   // workers from a previous process can no longer write after lease loss.
   const { startPurgeWorker } = require('./jobs/idempotencyPurge');
-  startPurgeWorker({ fencingToken: crypto.randomUUID() });
+  startPurgeWorker({ fencingToken: idempotencyFencingToken });
 
   // Start the invoice-state retention purge worker (issue #866) with its own
   // fencing token, isolated from the idempotency worker's token.
   const { startPurgeWorker: startInvoiceStatePurgeWorker } = require('./jobs/invoiceStatePurge');
-  startInvoiceStatePurgeWorker({ fencingToken: crypto.randomUUID() });
+  startInvoiceStatePurgeWorker({ fencingToken: invoiceStateFencingToken });
 
   startServer();
 }
@@ -122,3 +170,5 @@ module.exports = app;
 module.exports.createApp = createApp;
 module.exports.startServer = startServer;
 module.exports.resetStore = resetStore;
+module.exports.getFencingToken = getFencingToken;
+module.exports._resetStartupState = _resetStartupState;

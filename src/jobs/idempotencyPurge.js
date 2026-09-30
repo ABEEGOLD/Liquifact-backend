@@ -227,8 +227,60 @@ const purgeWorker = new BackgroundWorker({
   pollIntervalMs: 5000,
 });
 
-// Register the purge job handler
-purgeWorker.registerHandler('idempotency_purge', purgeExpiredKeys);
+/**
+ * Stores the fencing token for lease validation.
+ * @type {string|undefined}
+ */
+let currentFencingToken = undefined;
+
+/**
+ * Sets the fencing token for this worker instance.
+ * Jobs executed with a mismatched token will be rejected.
+ *
+ * @param {string} token - The fencing token to validate against.
+ */
+function setFencingToken(token) {
+  currentFencingToken = token;
+  logger.info({ token: token.substring(0, 8) + '...' }, '[idempotencyPurge] Fencing token set');
+}
+
+/**
+ * Validates that a job's fencing token matches the current process token.
+ * Rejects jobs from stale processes that lost their lease.
+ *
+ * @param {Object} job - The job to validate.
+ * @returns {boolean} True if the job should proceed, false if it should be rejected.
+ */
+function validateFencingToken(job) {
+  if (!currentFencingToken) {
+    // No fencing token configured, allow all jobs (backward compatibility)
+    return true;
+  }
+  
+  const jobToken = job.payload?.fencingToken;
+  if (!jobToken) {
+    logger.warn({ jobId: job.id }, '[idempotencyPurge] Job missing fencing token, rejecting');
+    return false;
+  }
+  
+  if (jobToken !== currentFencingToken) {
+    logger.warn(
+      { jobId: job.id, jobToken: jobToken.substring(0, 8) + '...', currentToken: currentFencingToken.substring(0, 8) + '...' },
+      '[idempotencyPurge] Job fencing token mismatch, rejecting stale job'
+    );
+    return false;
+  }
+  
+  return true;
+}
+
+// Register the purge job handler with fencing token validation
+purgeWorker.registerHandler('idempotency_purge', (job) => {
+  if (!validateFencingToken(job)) {
+    throw new Error('Job rejected: fencing token mismatch (stale process)');
+  }
+  return purgeExpiredKeys(job);
+});
 
 /**
  * Schedules the next idempotency purge job.
@@ -237,12 +289,14 @@ purgeWorker.registerHandler('idempotency_purge', purgeExpiredKeys);
  *
  * @param {Object} [options] - Scheduling options
  * @param {number} [options.delayMs] - Delay before executing (default: from config)
+ * @param {string} [options.fencingToken] - Fencing token for lease validation.
  * @returns {string} Job ID
  */
 function schedulePurge(options = {}) {
   const delayMs = options.delayMs ?? getIntervalMs();
+  const payload = options.fencingToken ? { fencingToken: options.fencingToken } : {};
 
-  const jobId = purgeQueue.enqueue('idempotency_purge', {}, { delayMs });
+  const jobId = purgeQueue.enqueue('idempotency_purge', payload, { delayMs });
 
   logger.debug({
     jobId,
@@ -259,15 +313,20 @@ function schedulePurge(options = {}) {
  * This should be called once at application startup to begin the periodic
  * cleanup process.
  *
+ * @param {Object} [options] - Startup options.
+ * @param {string} [options.fencingToken] - Fencing token for lease validation.
  * @returns {void}
  */
-function startPurgeWorker() {
+function startPurgeWorker(options = {}) {
   if (!purgeWorker.isRunning) {
+    if (options.fencingToken) {
+      setFencingToken(options.fencingToken);
+    }
     purgeWorker.start();
     logger.info('Idempotency purge worker started');
 
-    // Schedule the first purge job
-    schedulePurge();
+    // Schedule the first purge job with fencing token
+    schedulePurge({ fencingToken: options.fencingToken });
   }
 }
 
@@ -325,4 +384,6 @@ module.exports = {
   getMaxBatches,
   purgeQueue,
   purgeWorker,
+  setFencingToken,
+  validateFencingToken,
 };

@@ -134,18 +134,72 @@ const purgeWorker = new BackgroundWorker({
   pollIntervalMs: 5000,
 });
 
-purgeWorker.registerHandler(JOB_TYPE, (job) => runInvoiceStatePurge(job));
+/**
+ * Stores the fencing token for lease validation.
+ * @type {string|undefined}
+ */
+let currentFencingToken = undefined;
+
+/**
+ * Sets the fencing token for this worker instance.
+ * Jobs executed with a mismatched token will be rejected.
+ *
+ * @param {string} token - The fencing token to validate against.
+ */
+function setFencingToken(token) {
+  currentFencingToken = token;
+  logger.info({ token: token.substring(0, 8) + '...' }, '[invoiceStatePurge] Fencing token set');
+}
+
+/**
+ * Validates that a job's fencing token matches the current process token.
+ * Rejects jobs from stale processes that lost their lease.
+ *
+ * @param {Object} job - The job to validate.
+ * @returns {boolean} True if the job should proceed, false if it should be rejected.
+ */
+function validateFencingToken(job) {
+  if (!currentFencingToken) {
+    // No fencing token configured, allow all jobs (backward compatibility)
+    return true;
+  }
+  
+  const jobToken = job.payload?.fencingToken;
+  if (!jobToken) {
+    logger.warn({ jobId: job.id }, '[invoiceStatePurge] Job missing fencing token, rejecting');
+    return false;
+  }
+  
+  if (jobToken !== currentFencingToken) {
+    logger.warn(
+      { jobId: job.id, jobToken: jobToken.substring(0, 8) + '...', currentToken: currentFencingToken.substring(0, 8) + '...' },
+      '[invoiceStatePurge] Job fencing token mismatch, rejecting stale job'
+    );
+    return false;
+  }
+  
+  return true;
+}
+
+purgeWorker.registerHandler(JOB_TYPE, (job) => {
+  if (!validateFencingToken(job)) {
+    throw new Error('Job rejected: fencing token mismatch (stale process)');
+  }
+  return runInvoiceStatePurge(job);
+});
 
 /**
  * Enqueues a purge run.
  *
  * @param {object} [options={}]
  * @param {number} [options.delayMs=getIntervalMs()] - Delay before execution.
+ * @param {string} [options.fencingToken] - Fencing token for lease validation.
  * @returns {string} Job ID.
  */
 function schedulePurge(options = {}) {
   const delayMs = options.delayMs ?? getIntervalMs();
-  const jobId = purgeQueue.enqueue(JOB_TYPE, {}, { delayMs });
+  const payload = options.fencingToken ? { fencingToken: options.fencingToken } : {};
+  const jobId = purgeQueue.enqueue(JOB_TYPE, payload, { delayMs });
   logger.debug({ jobId, delayMs }, 'invoiceStatePurge: scheduled run');
   return jobId;
 }
@@ -153,12 +207,17 @@ function schedulePurge(options = {}) {
 /**
  * Starts the worker and schedules the first run. Safe to call twice.
  *
+ * @param {object} [options] - Startup options.
+ * @param {string} [options.fencingToken] - Fencing token for lease validation.
  * @returns {void}
  */
-function startPurgeWorker() {
+function startPurgeWorker(options = {}) {
   if (!purgeWorker.isRunning) {
+    if (options.fencingToken) {
+      setFencingToken(options.fencingToken);
+    }
     purgeWorker.start();
-    schedulePurge();
+    schedulePurge({ fencingToken: options.fencingToken });
     logger.info(
       { retentionDays: getRetentionDays(), intervalMs: getIntervalMs() },
       'invoiceStatePurge: worker started'
@@ -215,4 +274,6 @@ module.exports = {
   getIntervalMs,
   purgeQueue,
   purgeWorker,
+  setFencingToken,
+  validateFencingToken,
 };
