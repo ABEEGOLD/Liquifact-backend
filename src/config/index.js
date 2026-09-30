@@ -1,9 +1,34 @@
 /**
  * Centralized typed configuration module with runtime validation.
  * Uses Zod for schema validation and type safety.
+ *
+ * Concurrency contract
+ * --------------------
+ * This module is the single source of truth for process configuration and is
+ * read from boot code, request handlers, and background workers. It is designed
+ * to be safe under concurrent and repeated execution:
+ *
+ * 1. Atomic publication — `validate()` builds a complete candidate from a
+ *    point-in-time copy of `process.env`, then publishes it in one assignment.
+ *    Readers observe either the previous complete snapshot or the next complete
+ *    one, never a partially built object, even if `process.env` is mutated by
+ *    another code path (e.g. the admin runtime-config surface) mid-validation.
+ * 2. Immutable snapshots — published snapshots are deeply frozen, so one
+ *    consumer cannot mutate global configuration out from under another.
+ * 3. Idempotent repeats — re-validating an unchanged environment returns the
+ *    already-published snapshot instead of re-parsing it (no duplicate work, no
+ *    generation churn).
+ * 4. Single flight — a re-entrant `validate()` call cannot start a competing
+ *    parse. It returns the published snapshot, or fails fast with
+ *    `CONFIG_VALIDATION_IN_PROGRESS` when none has been published yet.
+ * 5. Fail-safe failures — a failed validation never mutates the published
+ *    snapshot, so the last known-good config keeps serving, and the failure is
+ *    observable through `getValidationState()`: staleness is never silent.
+ *
  * @module config
  */
 
+const crypto = require('crypto');
 const z = require('zod');
 
 /** Express-compatible request size string. @type {z.ZodDefault<z.ZodString>} */
@@ -132,24 +157,167 @@ const ConfigSchema = z
   });
 
 /**
- * Runtime validated configuration object.
- * @type {z.infer<typeof ConfigSchema>}
+ * Lifecycle states of the published configuration snapshot.
+ *
+ * - `unvalidated`: no validation attempt has completed yet.
+ * - `validating`: a validation is running; publication is not yet committed.
+ * - `valid`: `snapshot` was published from the most recent environment state.
+ * - `invalid`: the most recent attempt failed; `snapshot` (if any) is stale.
+ *
+ * @readonly
+ * @enum {string}
  */
-let config;
+const ValidationState = Object.freeze({
+  UNVALIDATED: 'unvalidated',
+  VALIDATING: 'validating',
+  VALID: 'valid',
+  INVALID: 'invalid',
+});
+
+/**
+ * The published, deeply frozen configuration snapshot. Assigned exactly once
+ * per successful validation, which is the atomic-publication invariant: readers
+ * can never observe a partially constructed config.
+ * @type {z.infer<typeof ConfigSchema>|null}
+ */
+let snapshot = null;
+
+/** Fingerprint of the env snapshot that produced the published `snapshot`. */
+let publishedFingerprint = null;
+
+/** Result of the most recent validation attempt. @type {string} */
+let validationState = ValidationState.UNVALIDATED;
+
+/** Error from the most recent failed attempt, or null. @type {Error|z.ZodError|null} */
+let lastValidationError = null;
+
+/** Single-flight guard: true while a validation is in progress. @type {boolean} */
+let isValidating = false;
+
+/** Number of successful publications. Monotonic; never decreases. @type {number} */
+let generation = 0;
+
+/**
+ * Recursively freezes a value so published configuration can never be mutated
+ * in place by a consumer.
+ * @template T
+ * @param {T} value - Value to freeze.
+ * @returns {T} The same value, deeply frozen.
+ */
+function deepFreeze(value) {
+  if (value === null || typeof value !== 'object' || Object.isFrozen(value)) {
+    return value;
+  }
+  Object.freeze(value);
+  for (const key of Object.keys(value)) {
+    deepFreeze(value[key]);
+  }
+  return value;
+}
+
+/**
+ * Takes a point-in-time copy of `process.env`.
+ *
+ * Copying first is what makes validation deterministic: every key is read once,
+ * so a concurrent `process.env` mutation (for example the admin config surface
+ * writing `CORS_ALLOWED_ORIGINS`) cannot produce a snapshot that mixes values
+ * from two different environment states.
+ *
+ * @returns {Record<string, string|undefined>} A private env copy.
+ */
+function copyEnv() {
+  return { ...process.env };
+}
+
+/**
+ * Computes an order-independent fingerprint of an environment snapshot.
+ * Used to detect that a repeat `validate()` has no new work to do.
+ * @param {Record<string, string|undefined>} envSnapshot - Env values to hash.
+ * @returns {string} Hex-encoded SHA-256 fingerprint.
+ */
+function fingerprintEnv(envSnapshot) {
+  const hash = crypto.createHash('sha256');
+  for (const key of Object.keys(envSnapshot).sort()) {
+    hash.update(`${key}\u0000${envSnapshot[key]}\u0000`);
+  }
+  return hash.digest('hex');
+}
 
 /**
  * Validates environment variables against schema and returns typed config.
- * Throws ZodError on validation failure.
- * Should be called once early in app bootstrap.
- * @returns {z.infer<typeof ConfigSchema>} Validated config.
+ *
+ * Safe to call repeatedly and concurrently: see the module-level concurrency
+ * contract. Published snapshots are immutable and returned by identity, so
+ * callers comparing two results can rely on object identity to mean "same
+ * environment, same config".
+ *
+ * @returns {z.infer<typeof ConfigSchema>} Frozen validated config.
+ * @throws {z.ZodError} When the environment fails schema validation.
+ * @throws {Error} With code `CONFIG_VALIDATION_IN_PROGRESS` when called
+ *   re-entrantly before any config has been published.
  */
 function validate() {
-  const parsed = ConfigSchema.safeParse(process.env);
+  // Single flight: never start a competing parse from inside an in-progress
+  // validation. Returning the published snapshot keeps the contract "one
+  // validation per synchronous burst" true and prevents a nested caller from
+  // publishing a divergent view of the environment.
+  if (isValidating) {
+    if (snapshot) {
+      return snapshot;
+    }
+    const inProgressError = new Error(
+      'Config validation is already in progress and no config has been published yet.'
+    );
+    inProgressError.code = 'CONFIG_VALIDATION_IN_PROGRESS';
+    throw inProgressError;
+  }
+
+  // Read the environment exactly once, up front.
+  const envSnapshot = copyEnv();
+  const fingerprint = fingerprintEnv(envSnapshot);
+
+  // Idempotent repeat: identical environment ⇒ identical already-published
+  // snapshot. Avoids duplicate work and generation churn on repeated boot paths.
+  if (
+    snapshot
+    && validationState === ValidationState.VALID
+    && fingerprint === publishedFingerprint
+  ) {
+    return snapshot;
+  }
+
+  isValidating = true;
+  validationState = ValidationState.VALIDATING;
+
+  let parsed;
+  try {
+    parsed = ConfigSchema.safeParse(envSnapshot);
+  } catch (err) {
+    // Defensive: safeParse is not expected to throw. If it does, record the
+    // attempt as invalid so the state machine never gets stuck "validating".
+    validationState = ValidationState.INVALID;
+    lastValidationError = err;
+    throw err;
+  } finally {
+    isValidating = false;
+  }
+
   if (!parsed.success) {
+    // Fail safe: keep the last known-good snapshot serving and record why, so
+    // the staleness is observable instead of silent. The published snapshot is
+    // never mutated or partially replaced here.
+    validationState = ValidationState.INVALID;
+    lastValidationError = parsed.error;
     throw parsed.error;
   }
-  config = parsed.data;
-  return config;
+
+  const nextSnapshot = deepFreeze(parsed.data);
+  snapshot = nextSnapshot; // Atomic publication: a single fully-built assignment.
+  publishedFingerprint = fingerprint;
+  generation += 1;
+  validationState = ValidationState.VALID;
+  lastValidationError = null;
+  return snapshot;
 }
 
 /**
@@ -172,13 +340,17 @@ function logRedactedSummary(error) {
 
 /**
  * Getter for validated config. Throws if not validated.
- * @returns {z.infer<typeof ConfigSchema>}
+ * The returned object is deeply frozen and shared; treat it as read-only.
+ * @returns {z.infer<typeof ConfigSchema>} Frozen validated config.
+ * @throws {Error} With code `CONFIG_NOT_VALIDATED` when called before `validate()`.
  */
 function get() {
-  if (!config) {
-    throw new Error('Config not validated. Call validate() first.');
+  if (!snapshot) {
+    const notValidatedError = new Error('Config not validated. Call validate() first.');
+    notValidatedError.code = 'CONFIG_NOT_VALIDATED';
+    throw notValidatedError;
   }
-  return config;
+  return snapshot;
 }
 
 /**
@@ -192,14 +364,50 @@ function getValue(key) {
 }
 
 /**
+ * Reports the validation lifecycle for diagnostics (logs, readiness probes).
+ * Deliberately contains no configuration values, so it is safe to expose.
+ *
+ * `stale` is true when a snapshot is being served even though the most recent
+ * validation attempt failed — callers should alert on it rather than treating
+ * the served config as the result of the latest environment.
+ *
+ * @returns {{state: string, validated: boolean, stale: boolean, generation: number, hasError: boolean}}
+ *   Redaction-safe validation status.
+ */
+function getValidationState() {
+  return {
+    state: validationState,
+    validated: validationState === ValidationState.VALID,
+    stale: snapshot !== null && validationState !== ValidationState.VALID,
+    generation,
+    hasError: lastValidationError !== null,
+  };
+}
+
+/**
+ * Returns the error from the most recent failed validation attempt.
+ * Callers must log it through `logRedactedSummary` to avoid leaking values.
+ * @returns {Error|z.ZodError|null} The last error, or null when the latest
+ *   attempt succeeded or none has run.
+ */
+function getValidationError() {
+  return lastValidationError;
+}
+
+/**
  * Returns the validated invoice PDF upload limit used when routes are built.
+ *
+ * Deterministic across the validation boundary: before `validate()` runs the
+ * value is derived from an atomic env copy with the same schema (so concurrent
+ * callers cannot disagree), and once validated the frozen snapshot is used.
+ *
  * @returns {string} Express-compatible request size limit.
  */
 function getInvoiceFileMaxSize() {
-  if (config) {
-    return config.INVOICE_FILE_MAX_SIZE;
+  if (snapshot) {
+    return snapshot.INVOICE_FILE_MAX_SIZE;
   }
-  return InvoiceFileMaxSizeSchema.parse(process.env.INVOICE_FILE_MAX_SIZE);
+  return InvoiceFileMaxSizeSchema.parse(copyEnv().INVOICE_FILE_MAX_SIZE);
 }
 
 const securityHeaders = {
@@ -242,9 +450,12 @@ module.exports = {
   validate,
   get,
   getValue,
+  getValidationState,
+  getValidationError,
   getInvoiceFileMaxSize,
   logRedactedSummary,
   ConfigSchema,
   InvoiceFileMaxSizeSchema,
+  ValidationState,
   securityHeaders,
 };
