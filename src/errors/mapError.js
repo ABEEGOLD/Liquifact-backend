@@ -41,17 +41,26 @@ function httpStatusToCode(status) {
  * Map framework and application errors into a stable HTTP error contract.
  *
  * @param {unknown} error Thrown error value.
- * @returns {{status: number, code: string, message: string, retryable: boolean, retryHint: string}}
+ * @returns {{status: number, code: string, message: string, retryable: boolean, retryHint: string, fieldErrors?: Array}}
  */
 function mapError(error) {
-  if (error && (error instanceof AppError || error.name === "AppError")) {
-    return {
+  // Use the canonical type guard instead of fragile instanceof + name checks.
+  if (AppError.is(error)) {
+    const mapped = {
       status: error.status,
       code: error.code || httpStatusToCode(error.status),
       message: error.detail || error.message,
+      // AppError guarantees retryable is always a boolean; keep ?? for safety
+      // against deserialized cross-boundary errors that lost their prototype.
       retryable: error.retryable ?? false,
       retryHint: error.retryHint ?? "",
     };
+    // Surface field-level validation errors when present so the error handler
+    // can include them in the response body without additional duck-typing.
+    if (Array.isArray(error.fieldErrors)) {
+      mapped.fieldErrors = error.fieldErrors;
+    }
+    return mapped;
   }
 
   if (
