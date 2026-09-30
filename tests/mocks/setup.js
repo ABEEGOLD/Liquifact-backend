@@ -10,6 +10,11 @@ jest.mock('../../src/metrics', () => {
     footprintCacheMissesTotal: makeCounter(),
     footprintCacheEvictionsTotal: makeCounter(),
 
+    // API-key registry cache counters (issue #1266) — so apiKeysCache.js can
+    // count hits/misses under test exactly as it does in production.
+    apiKeysCacheHitsTotal: makeCounter(),
+    apiKeysCacheMissesTotal: makeCounter(),
+
     // KYC webhook metrics — needed so route handlers can call
     // normalizeKycWebhookStatusClass / normalizeKycWebhookCause
     // in their res.on('finish') callbacks without crashing.
