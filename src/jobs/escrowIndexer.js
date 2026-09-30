@@ -18,6 +18,10 @@ const { StrKey } = require('@stellar/stellar-sdk');
 const { indexerEventSchema } = require('../schemas/indexerEvent');
 const { INVOICE_ID_REGEX } = require('../schemas/validationHelper');
 
+// ---------------------------------------------------------------------------
+// Error classes
+// ---------------------------------------------------------------------------
+
 class ValidationError extends Error {
   /**
    * Creates an indexer event validation error.
@@ -48,6 +52,10 @@ class LeaseLostError extends Error {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
 const DEFAULT_POLL_INTERVAL_MS = 15_000;
 const DEFAULT_BATCH_SIZE = 100;
 
@@ -56,7 +64,120 @@ const LEASE_KEY = 'worker_lease';
 const DEFAULT_LEASE_DURATION_MS = 30_000;
 
 /**
- * Validates a Stellar contract ID using StrKey encoding rules (starts with 'C', correct length, and valid checksum).
+ * Maximum number of retry attempts for transient fetch/persist errors.
+ * ValidationError and LeaseLostError are never retried.
+ *
+ * @type {number}
+ */
+const MAX_RETRY_ATTEMPTS = 3;
+
+/**
+ * Base delay (ms) for the first retry.  Subsequent attempts use exponential
+ * backoff: `BASE_RETRY_DELAY_MS * 2^(attempt - 1)` plus a random jitter of up
+ * to `BASE_RETRY_DELAY_MS`.
+ *
+ * @type {number}
+ */
+const BASE_RETRY_DELAY_MS = 200;
+
+/**
+ * Maximum total delay (ms) for any single retry attempt, preventing runaway
+ * backoff on deeply-failed retries.
+ *
+ * @type {number}
+ */
+const MAX_RETRY_DELAY_MS = 5_000;
+
+// ---------------------------------------------------------------------------
+// Transient-error retry helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns `true` when an error should NOT be retried.
+ *
+ * `ValidationError` and `LeaseLostError` are permanent failures: retrying
+ * them would produce the same outcome and could violate fencing invariants.
+ *
+ * @param {Error} err
+ * @returns {boolean}
+ */
+function isNonRetryableError(err) {
+  return err instanceof ValidationError || err instanceof LeaseLostError;
+}
+
+/**
+ * Executes `fn` up to `maxAttempts` times, retrying on transient errors with
+ * capped exponential backoff and jitter.
+ *
+ * Non-retryable errors (`ValidationError`, `LeaseLostError`) are re-thrown
+ * immediately without consuming retry budget.
+ *
+ * @param {Function} fn              - Async function to execute.
+ * @param {object}   [opts]          - Options.
+ * @param {number}   [opts.maxAttempts=MAX_RETRY_ATTEMPTS]   - Total attempts.
+ * @param {number}   [opts.baseDelayMs=BASE_RETRY_DELAY_MS]  - Base backoff ms.
+ * @param {number}   [opts.maxDelayMs=MAX_RETRY_DELAY_MS]    - Backoff ceiling ms.
+ * @param {object}   [opts.log]      - Logger for retry warnings.
+ * @param {string}   [opts.context]  - Human-readable label for log messages.
+ * @returns {Promise<{ result: *, retried: number }>} The function's result and
+ *   the number of retry attempts used (0 on first-attempt success).
+ * @throws The last error when all attempts are exhausted.
+ */
+async function withRetry(fn, {
+  maxAttempts = MAX_RETRY_ATTEMPTS,
+  baseDelayMs = BASE_RETRY_DELAY_MS,
+  maxDelayMs = MAX_RETRY_DELAY_MS,
+  log = logger,
+  context = 'operation',
+} = {}) {
+  let lastError;
+  let retried = 0;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const result = await fn();
+      return { result, retried };
+    } catch (err) {
+      // Non-retryable: propagate immediately.
+      if (isNonRetryableError(err)) {
+        throw err;
+      }
+
+      lastError = err;
+
+      if (attempt < maxAttempts) {
+        retried += 1;
+        // Capped exponential backoff with uniform jitter.
+        const exponential = baseDelayMs * Math.pow(2, attempt - 1);
+        const jitter = Math.random() * baseDelayMs;
+        const delay = Math.min(exponential + jitter, maxDelayMs);
+
+        log.warn(
+          {
+            err,
+            context,
+            attempt,
+            maxAttempts,
+            retryDelayMs: Math.round(delay),
+          },
+          `Transient error in ${context}; retrying (attempt ${attempt}/${maxAttempts}).`
+        );
+
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
+  }
+
+  throw lastError;
+}
+
+// ---------------------------------------------------------------------------
+// Stellar address / tx-hash validators
+// ---------------------------------------------------------------------------
+
+/**
+ * Validates a Stellar contract ID using StrKey encoding rules (starts with 'C',
+ * correct length, and valid checksum).
  *
  * @param {string} contractId - The contract ID to validate.
  * @returns {boolean} True if the contract ID is valid.
@@ -77,7 +198,8 @@ function isValidStellarContractId(contractId) {
 }
 
 /**
- * Validates a transaction hash (exactly 64 hexadecimal characters, case-insensitive, no prefixes).
+ * Validates a transaction hash (exactly 64 hexadecimal characters,
+ * case-insensitive, no prefixes).
  *
  * @param {string} txHash - The transaction hash to validate.
  * @returns {boolean} True if the transaction hash is valid.
@@ -167,6 +289,7 @@ function deriveInvoiceId(record, reverseLookup = resolveInvoiceByAddress) {
 
   return null;
 }
+
 /**
  * Validates and normalizes a raw escrow event into the canonical shape used by
  * the indexer's persistence and projection logic.
@@ -351,6 +474,7 @@ function createKnexEscrowEventStore(knex) {
     },
   };
 }
+
 /**
  * Decides whether an incoming event should replace the current per-invoice
  * projection, ordering by ledger sequence and breaking ties on paging token.
@@ -376,6 +500,7 @@ function shouldReplaceProjection(currentProjection, event) {
   const nextToken = String(event.pagingToken || '');
   return nextToken > currentToken;
 }
+
 /**
  * Persists a single escrow event idempotently and updates the per-invoice
  * projection if the event is newer than the current one.
@@ -474,9 +599,30 @@ async function fetchEscrowEventsFromHorizon({ baseUrl, cursor, limit }) {
 
   return { events, nextCursor };
 }
+
 /**
  * Runs one indexing cycle: fetches events, persists valid ones, skips invalid
  * ones, and advances the cursor when it changes.
+ *
+ * ## Deterministic failure recovery
+ *
+ * ### Transient-error retry
+ * Both the Horizon fetch and individual event persistence calls are wrapped in
+ * {@link withRetry}.  Transient errors (network timeouts, DB connection resets)
+ * are retried up to `MAX_RETRY_ATTEMPTS` times with capped exponential backoff
+ * and jitter.  `ValidationError` and `LeaseLostError` are never retried — they
+ * are permanent failures that do not benefit from a second attempt.
+ *
+ * ### Partial-batch checkpoint
+ * If a transient error exhausts all retries mid-batch, the cursor is advanced
+ * to the paging token of the **last successfully processed event** before the
+ * error is re-thrown.  This prevents the next cycle from re-processing already-
+ * persisted events, making progress even on a partially-completed batch.
+ *
+ * ### Observability
+ * - Retry attempts are logged at WARN with attempt count, delay, and context.
+ * - Partial checkpoints are logged at WARN with the saved cursor value.
+ * - The returned summary includes `retriedEvents` and `partialCursorSaved`.
  *
  * @param {object} deps - Cycle dependencies.
  * @param {object} deps.store - Event store implementation.
@@ -484,8 +630,12 @@ async function fetchEscrowEventsFromHorizon({ baseUrl, cursor, limit }) {
  * @param {Function} deps.transactionRunner - Runs a callback within a transaction.
  * @param {object} [deps.log] - Logger with warn/info/error.
  * @param {number} [deps.batchSize] - Max events to fetch per cycle.
- * @returns {Promise<object>} Summary with processed/skipped counts and
- *   cursorBefore/cursorAfter.
+ * @param {number} [deps.leaseDurationMs] - Lease duration in milliseconds.
+ * @param {number} [deps.maxRetryAttempts] - Override for retry budget per operation.
+ * @param {number} [deps.baseRetryDelayMs] - Override for retry base delay.
+ * @returns {Promise<object|null>} Summary with processed/skipped/retriedEvents/
+ *   partialCursorSaved counts and cursorBefore/cursorAfter, or null if lease
+ *   was not acquired.
  */
 async function runEscrowIndexerCycle({
   store,
@@ -494,6 +644,8 @@ async function runEscrowIndexerCycle({
   log = logger,
   batchSize = DEFAULT_BATCH_SIZE,
   leaseDurationMs = DEFAULT_LEASE_DURATION_MS,
+  maxRetryAttempts = MAX_RETRY_ATTEMPTS,
+  baseRetryDelayMs = BASE_RETRY_DELAY_MS,
 }) {
   const lease = typeof store.acquireLease === 'function'
     ? await store.acquireLease({ leaseDurationMs })
@@ -513,40 +665,129 @@ async function runEscrowIndexerCycle({
 
   try {
     const cursor = await store.loadCursor();
-    const { events, nextCursor } = await fetchEscrowEvents({ cursor, limit: batchSize });
+
+    // ── Fetch with retry ───────────────────────────────────────────────────
+    const { result: fetchResult, retried: fetchRetried } = await withRetry(
+      () => fetchEscrowEvents({ cursor, limit: batchSize }),
+      {
+        maxAttempts: maxRetryAttempts,
+        baseDelayMs: baseRetryDelayMs,
+        log,
+        context: 'fetchEscrowEvents',
+      }
+    );
+
+    if (fetchRetried > 0) {
+      log.info(
+        { fetchRetried, cursor },
+        `Escrow indexer fetch succeeded after ${fetchRetried} retr${fetchRetried === 1 ? 'y' : 'ies'}.`
+      );
+    }
+
+    const { events, nextCursor } = fetchResult;
 
     let processed = 0;
     let skipped = 0;
+    let retriedEvents = 0;
+    // Tracks the paging token of the last successfully persisted event so we
+    // can checkpoint the cursor on a partial-batch failure.
+    let lastSuccessfulPagingToken = null;
+    let partialCursorSaved = false;
 
     for (const rawEvent of events) {
-      if (lease && typeof store.renewLease === 'function') {
-        const renewed = await store.renewLease(lease.token, leaseDurationMs);
-        if (!renewed) {
-          throw new LeaseLostError('Escrow indexer lease expired before renewal.', 'LEASE_EXPIRED');
-        }
-        lease.expiresAt = renewed.expiresAt;
-        log.info(
-          { leaseToken: lease.token, expiresAt: new Date(lease.expiresAt).toISOString() },
-          'Escrow indexer lease renewed.'
-        );
-      }
-
       try {
-        await persistEscrowEvent(
-          { store, transactionRunner, fenceToken: lease && lease.token },
-          rawEvent
+        // ── Lease renewal ──────────────────────────────────────────────────
+        if (lease && typeof store.renewLease === 'function') {
+          const renewed = await store.renewLease(lease.token, leaseDurationMs);
+          if (!renewed) {
+            throw new LeaseLostError('Escrow indexer lease expired before renewal.', 'LEASE_EXPIRED');
+          }
+          lease.expiresAt = renewed.expiresAt;
+          log.info(
+            { leaseToken: lease.token, expiresAt: new Date(lease.expiresAt).toISOString() },
+            'Escrow indexer lease renewed.'
+          );
+        }
+
+        // ── Persist with retry ─────────────────────────────────────────────
+        const { retried: persistRetried } = await withRetry(
+          () => persistEscrowEvent(
+            { store, transactionRunner, fenceToken: lease && lease.token },
+            rawEvent
+          ),
+          {
+            maxAttempts: maxRetryAttempts,
+            baseDelayMs: baseRetryDelayMs,
+            log,
+            context: `persistEscrowEvent(eventId=${rawEvent && rawEvent.eventId})`,
+          }
         );
+
+        if (persistRetried > 0) {
+          retriedEvents += 1;
+          log.info(
+            { eventId: rawEvent && rawEvent.eventId, persistRetried },
+            `Escrow event persisted after ${persistRetried} retr${persistRetried === 1 ? 'y' : 'ies'}.`
+          );
+        }
+
         processed += 1;
+        // Advance the partial-checkpoint cursor to this event's paging token.
+        if (rawEvent && rawEvent.pagingToken) {
+          lastSuccessfulPagingToken = rawEvent.pagingToken;
+        }
       } catch (error) {
         if (error instanceof LeaseLostError) {
           log.error(
             { err: error, eventId: rawEvent && rawEvent.eventId },
             'Escrow indexer lease lost; aborting cycle.'
           );
+          // ── Partial-batch checkpoint ─────────────────────────────────────
+          // Save progress up to the last successful event so the next cycle
+          // resumes from where we left off rather than re-scanning from the
+          // beginning of the batch.
+          if (lastSuccessfulPagingToken && lastSuccessfulPagingToken !== cursor) {
+            try {
+              // No fenceToken here — the lease is already gone.
+              await store.saveCursor(lastSuccessfulPagingToken);
+              partialCursorSaved = true;
+              log.warn(
+                { partialCursor: lastSuccessfulPagingToken },
+                'Escrow indexer saved partial-batch checkpoint cursor before LeaseLost abort.'
+              );
+            } catch (saveErr) {
+              log.error(
+                { err: saveErr, partialCursor: lastSuccessfulPagingToken },
+                'Escrow indexer failed to save partial-batch checkpoint cursor.'
+              );
+            }
+          }
           throw error;
         }
+
+        // Transient error exhausted retries or permanent ValidationError: skip.
         skipped += 1;
         log.warn({ err: error, eventId: rawEvent && rawEvent.eventId }, 'Skipping invalid escrow event.');
+
+        // ── Partial-batch checkpoint on transient exhaustion ───────────────
+        // If this was a transient error (not ValidationError), the retry
+        // budget was exhausted.  Save progress so the next cycle doesn't
+        // redo successfully-processed events.
+        if (!(error instanceof ValidationError) && lastSuccessfulPagingToken && lastSuccessfulPagingToken !== cursor) {
+          try {
+            await store.saveCursor(lastSuccessfulPagingToken, lease && lease.token);
+            partialCursorSaved = true;
+            log.warn(
+              { partialCursor: lastSuccessfulPagingToken, eventId: rawEvent && rawEvent.eventId },
+              'Escrow indexer saved partial-batch checkpoint cursor after transient exhaustion.'
+            );
+          } catch (saveErr) {
+            log.error(
+              { err: saveErr, partialCursor: lastSuccessfulPagingToken },
+              'Escrow indexer failed to save partial-batch checkpoint cursor.'
+            );
+          }
+        }
       }
     }
 
@@ -562,6 +803,8 @@ async function runEscrowIndexerCycle({
     return {
       processed,
       skipped,
+      retriedEvents,
+      partialCursorSaved,
       cursorBefore: cursor,
       cursorAfter: nextCursor || cursor || null,
       leaseToken: lease && lease.token,
@@ -573,6 +816,7 @@ async function runEscrowIndexerCycle({
     throw error;
   }
 }
+
 /**
  * Creates an escrow indexer with start/stop polling control and a re-entrancy
  * guarded runCycle.
@@ -619,6 +863,7 @@ function createEscrowIndexer(options = {}) {
         transactionRunner,
         log: options.log || logger,
         batchSize: Number(process.env.ESCROW_INDEXER_BATCH_SIZE || DEFAULT_BATCH_SIZE),
+        leaseDurationMs,
       });
       (options.log || logger).info(summary, 'Escrow indexer cycle completed.');
 
@@ -698,4 +943,10 @@ module.exports = {
   isValidTxHash,
   ValidationError,
   LeaseLostError,
+  // Exported for testing
+  withRetry,
+  isNonRetryableError,
+  MAX_RETRY_ATTEMPTS,
+  BASE_RETRY_DELAY_MS,
+  MAX_RETRY_DELAY_MS,
 };
