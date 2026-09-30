@@ -31,7 +31,8 @@
 
 /**
  * Aggregated invoice counts returned by the SME metrics endpoint.
- * Every field is a non-negative integer.
+ * Every field is a finite, non-negative number. Fractional values are
+ * preserved for backward compatibility; service-generated counts are integers.
  *
  * @typedef {Object} SmeMetricsResponse
  * @property {number} open      - Count of open invoices (pending_verification + verified).
@@ -109,6 +110,44 @@
 // ---------------------------------------------------------------------------
 
 /**
+ * Coerces numeric input without allowing exceptional values to escape.
+ *
+ * @param {unknown} value - Candidate numeric value.
+ * @returns {number|null} Finite number, or null when coercion is invalid.
+ */
+function toFiniteNumber(value) {
+  try {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Normalises a non-negative metric value while preserving legacy fractions.
+ *
+ * @param {unknown} value - Candidate count value.
+ * @returns {number}
+ */
+function toNonNegativeMetric(value) {
+  const number = toFiniteNumber(value);
+  return number !== null && number >= 0 ? number : 0;
+}
+
+/**
+ * Copies the page array and its plain row objects to isolate response DTOs.
+ *
+ * @param {Object[]} rows - Invoice rows from the service.
+ * @returns {Object[]}
+ */
+function snapshotInvoiceRows(rows) {
+  return rows.map((row) => (
+    row && typeof row === 'object' && !Array.isArray(row) ? { ...row } : row
+  ));
+}
+
+/**
  * Maps a raw invoice-counts object to a typed {@link SmeMetricsResponse} DTO.
  *
  * Every field is coerced to a safe integer.  Unknown keys on the raw object
@@ -120,10 +159,10 @@
 function toSmeMetricsResponse(raw) {
   const obj = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {};
   return {
-    open: Number(obj.open) || 0,
-    funded: Number(obj.funded) || 0,
-    settled: Number(obj.settled) || 0,
-    defaulted: Number(obj.defaulted) || 0,
+    open: toNonNegativeMetric(obj.open),
+    funded: toNonNegativeMetric(obj.funded),
+    settled: toNonNegativeMetric(obj.settled),
+    defaulted: toNonNegativeMetric(obj.defaulted),
   };
 }
 
@@ -148,7 +187,9 @@ function toSmeMetricsMeta(raw) {
 
   // Optional pagination fields — only include when the source had them.
   if (Array.isArray(obj.invoices)) {
-    meta.invoices = obj.invoices;
+    // Snapshot page membership/order so later mutations cannot change another
+    // response built from the same service result.
+    meta.invoices = snapshotInvoiceRows(obj.invoices);
   }
   if (typeof obj.total === 'number' && Number.isFinite(obj.total)) {
     meta.total = Math.max(0, Math.floor(obj.total));
@@ -209,11 +250,15 @@ function toSmeMetricsApiResponse(data, meta, error = null) {
  */
 function toPersistenceRecordParams(raw) {
   const obj = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {};
+  const statusCode = toFiniteNumber(obj.statusCode);
+  const durationSeconds = toFiniteNumber(obj.durationSeconds);
 
   return {
     endpoint: String(obj.endpoint || 'unknown'),
-    statusCode: Number(obj.statusCode) || 200,
-    durationSeconds: Number(obj.durationSeconds) || 0,
+    statusCode: Number.isInteger(statusCode) && statusCode >= 100 && statusCode <= 599
+      ? statusCode
+      : 200,
+    durationSeconds: durationSeconds !== null && durationSeconds >= 0 ? durationSeconds : 0,
     cause: /** @type {PersistenceCause} */ (String(obj.cause || 'none')),
     req: obj.req || undefined,
   };
@@ -234,10 +279,9 @@ function isValidSmeMetricsResponse(value) {
     return false;
   }
   return (
-    typeof value.open === 'number' &&
-    typeof value.funded === 'number' &&
-    typeof value.settled === 'number' &&
-    typeof value.defaulted === 'number'
+    [value.open, value.funded, value.settled, value.defaulted].every(
+      (count) => typeof count === 'number' && Number.isFinite(count) && count >= 0,
+    )
   );
 }
 
@@ -253,8 +297,8 @@ function isValidPersistenceRecordParams(value) {
   }
   return (
     typeof value.endpoint === 'string' &&
-    typeof value.statusCode === 'number' &&
-    typeof value.durationSeconds === 'number' &&
+    Number.isInteger(value.statusCode) && value.statusCode >= 100 && value.statusCode <= 599 &&
+    typeof value.durationSeconds === 'number' && Number.isFinite(value.durationSeconds) && value.durationSeconds >= 0 &&
     typeof value.cause === 'string'
   );
 }
