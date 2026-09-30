@@ -15,8 +15,25 @@
  * document (`code`) and per-field (`fieldCodes`). Message wording remains free
  * to change; the codes are the contract.
  *
+ * ## Compatibility contract
+ * This module guarantees:
+ * - All exported symbols are present and have the expected types at runtime
+ * - The codes object is frozen and cannot be mutated
+ * - Each code value equals its key (self-describing on the wire)
+ * - The top-level error code and problem type URI are stable
+ * - Adding new codes is backward-compatible (existing callers unaffected)
+ * - Removing or renaming codes is a breaking change (requires major version bump)
+ *
  * @module constants/metricsValidationCodes
  */
+
+/**
+ * Version of the validation code taxonomy.
+ * Increment when adding new codes. Increment major when removing/renaming codes.
+ *
+ * @type {string}
+ */
+const METRICS_VALIDATION_CODES_VERSION = '1.0.0';
 
 /**
  * Bounded set of per-issue validation codes.
@@ -152,9 +169,103 @@ function codeForIssue(issue) {
   }
 }
 
+/**
+ * Validates that the module exports satisfy the compatibility contract.
+ *
+ * This function runs at module load time to ensure:
+ * - All expected exports are present
+ * - Exports have the correct types
+ * - The codes object is frozen
+ * - Code values are stable (key equals value)
+ *
+ * @throws {Error} If any compatibility contract is violated.
+ * @returns {void}
+ */
+function validateCompatibilityContract() {
+  // Validate METRICS_VALIDATION_CODES is frozen
+  if (!Object.isFrozen(METRICS_VALIDATION_CODES)) {
+    throw new Error(
+      '[metricsValidationCodes] METRICS_VALIDATION_CODES must be frozen to prevent runtime mutations.'
+    );
+  }
+
+  // Validate each code value equals its key (self-describing)
+  for (const [key, value] of Object.entries(METRICS_VALIDATION_CODES)) {
+    if (value !== key) {
+      throw new Error(
+        `[metricsValidationCodes] Code value must equal its key for wire stability. Got key="${key}", value="${value}"`
+      );
+    }
+  }
+
+  // Validate KNOWN_CODES Set contains all code values
+  for (const value of Object.values(METRICS_VALIDATION_CODES)) {
+    if (!KNOWN_CODES.has(value)) {
+      throw new Error(
+        `[metricsValidationCodes] KNOWN_CODES Set is missing code value "${value}"`
+      );
+    }
+  }
+
+  // Validate top-level constants are strings
+  if (typeof METRICS_VALIDATION_ERROR_CODE !== 'string') {
+    throw new Error(
+      '[metricsValidationCodes] METRICS_VALIDATION_ERROR_CODE must be a string.'
+    );
+  }
+
+  if (typeof METRICS_VALIDATION_PROBLEM_TYPE !== 'string') {
+    throw new Error(
+      '[metricsValidationCodes] METRICS_VALIDATION_PROBLEM_TYPE must be a string.'
+    );
+  }
+
+  // Validate problem type URI is a valid URI format
+  if (!METRICS_VALIDATION_PROBLEM_TYPE.startsWith('https://')) {
+    throw new Error(
+      '[metricsValidationCodes] METRICS_VALIDATION_PROBLEM_TYPE must be an HTTPS URI.'
+    );
+  }
+
+  // Validate codeForIssue is a function
+  if (typeof codeForIssue !== 'function') {
+    throw new Error(
+      '[metricsValidationCodes] codeForIssue must be a function.'
+    );
+  }
+
+  // Validate codeForIssue returns known codes for all known issue codes
+  const testCases = [
+    { code: 'invalid_type', received: 'undefined' },
+    { code: 'invalid_type', received: 'number' },
+    { code: 'unrecognized_keys', keys: [] },
+    { code: 'too_small', origin: 'string' },
+    { code: 'too_big', origin: 'string' },
+    { code: 'too_small', origin: 'array' },
+    { code: 'too_big', origin: 'array' },
+    { code: 'too_small', origin: 'number' },
+    { code: 'too_big', origin: 'number' },
+    { code: 'not_multiple_of' },
+    { code: 'invalid_format' },
+  ];
+
+  for (const testCase of testCases) {
+    const result = codeForIssue(testCase);
+    if (!KNOWN_CODES.has(result)) {
+      throw new Error(
+        `[metricsValidationCodes] codeForIssue returned unknown code "${result}" for issue ${JSON.stringify(testCase)}`
+      );
+    }
+  }
+}
+
+// Run compatibility validation at module load time
+validateCompatibilityContract();
+
 module.exports = {
   METRICS_VALIDATION_CODES,
   METRICS_VALIDATION_ERROR_CODE,
   METRICS_VALIDATION_PROBLEM_TYPE,
   codeForIssue,
+  METRICS_VALIDATION_CODES_VERSION,
 };
