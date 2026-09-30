@@ -17,12 +17,12 @@ const API_KEY_PREFIX = 'lf_';
  * All scopes recognised by the system.
  * @type {string[]}
  */
-const VALID_SCOPES = [
+const VALID_SCOPES = Object.freeze([
   'invoices:read',
   'invoices:write',
   'escrow:read',
   'admin',
-];
+]);
 
 /**
  * The minimum required length of the full API key (prefix included).
@@ -53,7 +53,10 @@ const MAX_SCOPES_COUNT = 20;
  * treated as an unknown / unsupported key.
  * @type {Set<string>}
  */
-const KNOWN_ENTRY_FIELDS = new Set(['key', 'clientId', 'scopes', 'revoked']);
+const KNOWN_ENTRY_FIELD_NAMES = Object.freeze(['key', 'clientId', 'scopes', 'revoked']);
+const KNOWN_ENTRY_FIELD_SET = new Set(KNOWN_ENTRY_FIELD_NAMES);
+// Keep the historical Set export, but do not let callers mutate validation.
+const KNOWN_ENTRY_FIELDS = new Set(KNOWN_ENTRY_FIELD_NAMES);
 
 /**
  * @typedef {Object} ApiKeyEntry
@@ -72,7 +75,7 @@ const KNOWN_ENTRY_FIELDS = new Set(['key', 'clientId', 'scopes', 'revoked']);
  */
 function rejectUnknownFields(entry, index) {
   const extraKeys = Object.keys(entry).filter(
-    (k) => !KNOWN_ENTRY_FIELDS.has(k)
+    (k) => !KNOWN_ENTRY_FIELD_SET.has(k)
   );
   if (extraKeys.length > 0) {
     throw new Error(
@@ -203,9 +206,22 @@ function parseApiKeys(raw) {
  * @throws {Error} When the same key string appears more than once.
  */
 function buildKeyRegistry(entries) {
+  if (!Array.isArray(entries)) {
+    throw new Error('API_KEYS: entries must be an array');
+  }
+
   const registry = new Map();
 
-  for (const entry of entries) {
+  // Validate and normalize every input, even for callers that bypass parsing.
+  // The local map is returned only after all entries pass validation.
+  for (const [index, candidate] of entries.entries()) {
+    const validated = validateEntry(candidate, index);
+    // The registry owns an immutable snapshot; caller-owned objects and arrays
+    // cannot later change key identity, client metadata, revocation, or scopes.
+    const entry = Object.freeze({
+      ...validated,
+      scopes: Object.freeze([...validated.scopes]),
+    });
     if (registry.has(entry.key)) {
       throw new Error(
         `API_KEYS: duplicate key detected for clientId "${entry.clientId}"`
