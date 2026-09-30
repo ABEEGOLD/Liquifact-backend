@@ -17,6 +17,7 @@ describe('config/stellar', () => {
 
   beforeEach(() => {
     process.env = { ...originalEnv, NODE_ENV: 'development' };
+    delete process.env.STELLAR_NETWORK_PASSPHRASE;
   });
 
   afterEach(() => {
@@ -78,6 +79,15 @@ describe('config/stellar', () => {
       expect(() => validateStellarConfig()).toThrow('Invalid STELLAR_NETWORK');
     });
 
+    it('should reject whitespace-padded and case-mismatched network names', () => {
+      process.env.SOROBAN_RPC_URL = NETWORK_RPC_MAP.TESTNET;
+
+      for (const network of [' TESTNET', 'TESTNET ', 'testnet']) {
+        process.env.STELLAR_NETWORK = network;
+        expect(() => validateStellarConfig()).toThrow('Invalid STELLAR_NETWORK');
+      }
+    });
+
     it('should throw when TESTNET paired with MAINNET RPC', () => {
       process.env.STELLAR_NETWORK = 'TESTNET';
       process.env.SOROBAN_RPC_URL = NETWORK_RPC_MAP.MAINNET;
@@ -105,6 +115,29 @@ describe('config/stellar', () => {
 
       expect(() => validateStellarConfig()).toThrow(
         'STELLAR_NETWORK=TESTNET requires SOROBAN_RPC_URL="https://soroban-testnet.stellar.org"'
+      );
+    });
+
+    it('should reject whitespace, malformed, and boundary-modified RPC URLs', () => {
+      process.env.STELLAR_NETWORK = 'TESTNET';
+
+      for (const rpcUrl of [
+        ' https://soroban-testnet.stellar.org',
+        'https://soroban-testnet.stellar.org/',
+        'not a URL',
+      ]) {
+        process.env.SOROBAN_RPC_URL = rpcUrl;
+        expect(() => validateStellarConfig()).toThrow('requires SOROBAN_RPC_URL');
+      }
+    });
+
+    it('should reject an explicitly configured passphrase for another network', () => {
+      process.env.STELLAR_NETWORK = 'MAINNET';
+      process.env.SOROBAN_RPC_URL = NETWORK_RPC_MAP.MAINNET;
+      process.env.STELLAR_NETWORK_PASSPHRASE = NETWORK_PASSPHRASE_MAP.TESTNET;
+
+      expect(() => validateStellarConfig()).toThrow(
+        'STELLAR_NETWORK_PASSPHRASE does not match STELLAR_NETWORK'
       );
     });
   });

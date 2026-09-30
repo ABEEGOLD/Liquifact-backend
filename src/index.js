@@ -15,6 +15,7 @@ require('dotenv').config();
 const crypto = require('crypto');
 const app = require('./app');
 const { validate, logRedactedSummary } = require('./config');
+const { validateStellarConfig } = require('./config/stellar');
 const shutdownCoordinator = require('./utils/shutdownCoordinator');
 
 /**
@@ -45,6 +46,8 @@ function runBootConfigValidation() {
   }
   try {
     validate();
+    const stellarConfig = validateStellarConfig();
+    process.env.STELLAR_NETWORK_PASSPHRASE = stellarConfig.passphrase;
     
     // Boot-time dependency validation phase
     const { validateDependencies } = require('./config/dependencyValidator');
