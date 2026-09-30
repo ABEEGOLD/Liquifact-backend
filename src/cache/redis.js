@@ -220,6 +220,13 @@ class RedisEscrowSummaryCache {
 
       const entry = JSON.parse(raw);
       if (
+        entry === null ||
+        typeof entry !== 'object' ||
+        !Object.prototype.hasOwnProperty.call(entry, 'summary')
+      ) {
+        throw new Error('Invalid Redis escrow summary entry');
+      }
+      if (
         Number.isFinite(currentLedger) &&
         Number.isFinite(entry.cachedLedger) &&
         Math.abs(currentLedger - entry.cachedLedger) > this.ledgerGapThreshold
@@ -252,18 +259,17 @@ class RedisEscrowSummaryCache {
    * @returns {Promise<boolean>} True if the summary was successfully cached.
    */
   async setSummary(invoiceId, summary, currentLedger) {
-    if (!this.client || !isValidInvoiceId(invoiceId)) {
+    if (!this.client || !isValidInvoiceId(invoiceId) || summary === undefined) {
       return false;
     }
 
     const key = this.key(invoiceId);
-    const payload = JSON.stringify({
-      summary,
-      cachedLedger: Number.isFinite(currentLedger) ? currentLedger : null,
-      cachedAt: new Date().toISOString(),
-    });
-
     try {
+      const payload = JSON.stringify({
+        summary,
+        cachedLedger: Number.isFinite(currentLedger) ? currentLedger : null,
+        cachedAt: new Date().toISOString(),
+      });
       const result = await this.circuitBreaker.execute(() =>
         withTimeout(this.client.set(key, payload, 'EX', this.ttlSeconds), this.timeoutMs)
       );
