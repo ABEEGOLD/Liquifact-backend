@@ -3,9 +3,9 @@
 /**
  * @fileoverview Typed DTO helpers for admin config request/response boundaries.
  *
- * These helpers keep the route contract explicit without changing runtime
- * behavior. They map plain objects to/from a small typed DTO envelope that is
- * easier to evolve safely during refactors.
+ * These helpers keep the route contract explicit and isolate DTO state from
+ * caller mutations. They map plain objects to/from a small typed DTO envelope
+ * that is easier to evolve safely during refactors.
  *
  * @module dto/config
  */
@@ -29,6 +29,17 @@
  */
 
 /**
+ * Copy config data so nested mutable values are not shared across DTO boundaries.
+ * Config payloads are structured-cloneable JSON data after request validation.
+ *
+ * @param {Record<string, unknown>} config - Config payload to copy.
+ * @returns {Record<string, unknown>} An independent config snapshot.
+ */
+function cloneConfig(config) {
+  return structuredClone(config);
+}
+
+/**
  * Map a raw admin config request payload into a typed request DTO.
  *
  * @param {unknown} payload - Raw request payload from the route boundary.
@@ -41,7 +52,7 @@ function toAdminConfigRequestDto(payload) {
 
   const section = typeof payload.section === 'string' ? payload.section : '';
   const config = payload.config && typeof payload.config === 'object' && !Array.isArray(payload.config)
-    ? { ...payload.config }
+    ? cloneConfig(payload.config)
     : {};
 
   return { section, config };
@@ -70,7 +81,7 @@ function toAdminConfigResponseDto(payload) {
 
   const section = typeof payload.section === 'string' ? payload.section : '';
   const config = payload.config && typeof payload.config === 'object' && !Array.isArray(payload.config)
-    ? { ...payload.config }
+    ? cloneConfig(payload.config)
     : {};
   const message = typeof payload.message === 'string' ? payload.message : '';
 
