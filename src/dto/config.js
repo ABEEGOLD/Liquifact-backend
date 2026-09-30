@@ -10,6 +10,71 @@
  * @module dto/config
  */
 
+const { CONFIG_SECTIONS } = require('../schemas/config');
+
+/**
+ * Validate that a value is a plain record with only the allowed own keys.
+ *
+ * @param {unknown} value - Value to validate.
+ * @param {string[]} allowedKeys - Keys accepted at this DTO boundary.
+ * @param {string} label - Name used in the error message.
+ * @param {string[]} requiredKeys - Keys that must be own properties.
+ * @returns {Record<string, unknown>} The validated record.
+ * @throws {TypeError} If the value is not a plain record or has extra keys.
+ */
+function requireRecord(value, allowedKeys, label, requiredKeys = []) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError(`${label} must be an object`);
+  }
+
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError(`${label} must be a plain object`);
+  }
+
+  const unexpectedKeys = Object.keys(value).filter((key) => !allowedKeys.includes(key));
+  if (unexpectedKeys.length > 0) {
+    throw new TypeError(`${label} contains unsupported fields`);
+  }
+
+  if (requiredKeys.some((key) => !Object.prototype.hasOwnProperty.call(value, key))) {
+    throw new TypeError(`${label} is missing required fields`);
+  }
+
+  return value;
+}
+
+/**
+ * Validate a known configuration section name.
+ *
+ * @param {unknown} section - Section value to validate.
+ * @returns {string} The validated section name.
+ * @throws {TypeError} If the section is not supported.
+ */
+function requireSection(section) {
+  if (typeof section !== 'string' || !CONFIG_SECTIONS.includes(section)) {
+    throw new TypeError('section must be a supported configuration section');
+  }
+
+  return section;
+}
+
+/**
+ * Validate section-specific config as a plain record.
+ * Field-level constraints remain the responsibility of the section schemas.
+ *
+ * @param {unknown} config - Config payload to validate.
+ * @returns {Record<string, unknown>} A shallow copy of the validated config.
+ * @throws {TypeError} If config is not a plain object.
+ */
+function requireConfig(config) {
+  const allowedKeys = config && typeof config === 'object' && !Array.isArray(config)
+    ? Object.keys(config)
+    : [];
+  const record = requireRecord(config, allowedKeys, 'config');
+  return { ...record };
+}
+
 /**
  * @typedef {Object} AdminConfigRequestDto
  * @property {string} section - Configuration section name.
@@ -35,14 +100,9 @@
  * @returns {AdminConfigRequestDto} A normalized request DTO.
  */
 function toAdminConfigRequestDto(payload) {
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-    return { section: '', config: {} };
-  }
-
-  const section = typeof payload.section === 'string' ? payload.section : '';
-  const config = payload.config && typeof payload.config === 'object' && !Array.isArray(payload.config)
-    ? { ...payload.config }
-    : {};
+  const record = requireRecord(payload, ['section', 'config'], 'request', ['section', 'config']);
+  const section = requireSection(record.section);
+  const config = requireConfig(record.config);
 
   return { section, config };
 }
@@ -64,17 +124,14 @@ function fromAdminConfigRequestDto(dto) {
  * @returns {AdminConfigResponseDto} A normalized response DTO.
  */
 function toAdminConfigResponseDto(payload) {
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-    return { section: '', config: {}, message: '' };
+  const record = requireRecord(payload, ['section', 'config', 'message'], 'response', ['section', 'config', 'message']);
+  const section = requireSection(record.section);
+  const config = requireConfig(record.config);
+  if (typeof record.message !== 'string') {
+    throw new TypeError('message must be a string');
   }
 
-  const section = typeof payload.section === 'string' ? payload.section : '';
-  const config = payload.config && typeof payload.config === 'object' && !Array.isArray(payload.config)
-    ? { ...payload.config }
-    : {};
-  const message = typeof payload.message === 'string' ? payload.message : '';
-
-  return { section, config, message };
+  return { section, config, message: record.message };
 }
 
 /**
@@ -95,10 +152,15 @@ function fromAdminConfigResponseDto(dto) {
  */
 function toConfigSectionsResponseDto(sections) {
   if (!Array.isArray(sections)) {
-    return { sections: [] };
+    throw new TypeError('sections must be an array');
   }
 
-  return { sections: sections.filter((section) => typeof section === 'string') };
+  const normalizedSections = sections.map(requireSection);
+  if (new Set(normalizedSections).size !== normalizedSections.length) {
+    throw new TypeError('sections must not contain duplicates');
+  }
+
+  return { sections: normalizedSections };
 }
 
 /**
@@ -108,7 +170,8 @@ function toConfigSectionsResponseDto(sections) {
  * @returns {ConfigSectionsResponseDto} A sections DTO with the same boundary shape.
  */
 function fromConfigSectionsResponseDto(dto) {
-  return toConfigSectionsResponseDto(dto && dto.sections);
+  const record = requireRecord(dto, ['sections'], 'sections response', ['sections']);
+  return toConfigSectionsResponseDto(record.sections);
 }
 
 module.exports = {
