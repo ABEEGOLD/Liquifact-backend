@@ -347,6 +347,7 @@ Assume testnet configuration and a mapping entry in `ESCROW_ADDR_BY_INVOICE`.
 
 | Doc | Focus |
 |-----|--------|
+| [bounty-contract-compatibility.md](./bounty-contract-compatibility.md) | Existing bounty ABI, storage, lifecycle guards, and regression checks |
 | [escrow-indexing-strategy.md](./escrow-indexing-strategy.md) | Horizon poller vs Captive Core upgrade |
 | [escrow-deployment-model.md](./escrow-deployment-model.md) | Per-instance deployment, invariants, factory risks |
 | [ops-signing.md](./ops-signing.md) | Delegated vs custodial signing, KMS, funding API |

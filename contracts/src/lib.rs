@@ -42,7 +42,11 @@ impl BountyContract {
         env.storage()
             .instance()
             .set(&DataKey::FeeRecipient, &fee_recipient);
-        env.storage().instance().set(&DataKey::NextId, &0u64);
+        // Legacy callers may create bounties before initialization. Preserve their
+        // counter instead of resetting it and overwriting already funded escrow.
+        if !env.storage().instance().has(&DataKey::NextId) {
+            env.storage().instance().set(&DataKey::NextId, &0u64);
+        }
     }
 
     /// Create a bounty.
@@ -62,11 +66,19 @@ impl BountyContract {
         assert!(amount > 0,           "amount must be positive");
         assert!(protocol_fee_bps <= 10_000, "fee_bps must be <= 10000");
 
+        let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
+        let next_id = id.checked_add(1).expect("bounty id exhausted");
+        // Never replace a legacy bounty if a counter is missing or inconsistent.
+        // Check before interacting with the token, and keep the existing keys.
+        assert!(
+            !env.storage().persistent().has(&DataKey::Bounty(id)),
+            "bounty id already exists"
+        );
+
         // Pull funds into the contract.
         let client = token::Client::new(&env, &token);
         client.transfer(&creator, &env.current_contract_address(), &amount);
 
-        let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
         let bounty = Bounty {
             creator,
             hunter,
@@ -76,7 +88,7 @@ impl BountyContract {
             released: false,
         };
         env.storage().persistent().set(&DataKey::Bounty(id), &bounty);
-        env.storage().instance().set(&DataKey::NextId, &(id + 1));
+        env.storage().instance().set(&DataKey::NextId, &next_id);
 
         env.events().publish(
             (Symbol::new(&env, "bounty_created"), id),
@@ -108,17 +120,26 @@ impl BountyContract {
 
         let client = token::Client::new(&env, &bounty.token);
 
-        // fee = amount * bps / 10_000  (integer division, rounds down)
-        let fee: i128 = bounty.amount * (bounty.protocol_fee_bps as i128) / 10_000;
+        // Validate persisted records too: upgrades must not turn malformed legacy
+        // data into negative payouts or mint-like token transfers.
+        assert!(bounty.amount > 0, "amount must be positive");
+        assert!(bounty.protocol_fee_bps <= 10_000, "fee_bps must be <= 10000");
+
+        // Same floor(amount * bps / 10_000), without overflowing for valid i128
+        // amounts. Both products are bounded when amount > 0 and bps <= 10_000.
+        let bps = i128::from(bounty.protocol_fee_bps);
+        let fee = (bounty.amount / 10_000) * bps + ((bounty.amount % 10_000) * bps) / 10_000;
         let payout: i128 = bounty.amount - fee;
+
+        // Reserve the release before external calls. Soroban invocation rollback
+        // restores this flag, balances and events if either transfer fails.
+        bounty.released = true;
+        env.storage().persistent().set(&DataKey::Bounty(id), &bounty);
 
         if fee > 0 {
             client.transfer(&env.current_contract_address(), &fee_recipient, &fee);
         }
         client.transfer(&env.current_contract_address(), &bounty.hunter, &payout);
-
-        bounty.released = true;
-        env.storage().persistent().set(&DataKey::Bounty(id), &bounty);
 
         env.events().publish(
             (Symbol::new(&env, "bounty_released"), id),
@@ -148,7 +169,7 @@ mod tests {
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
-    fn setup() -> (Env, Address, Address, Address, Address, Address) {
+    pub(super) fn setup() -> (Env, Address, Address, Address, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -262,12 +283,18 @@ mod tests {
     // ── double-release guard ─────────────────────────────────────────────────
 
     #[test]
-    #[should_panic(expected = "already released")]
     fn test_cannot_release_twice() {
         let (env, contract_id, _fee_recipient, creator, hunter, token) = setup();
         let client = BountyContractClient::new(&env, &contract_id);
         let id = client.create_bounty(&creator, &hunter, &token, &500_i128, &0u32);
         client.release_bounty(&id);
-        client.release_bounty(&id); // should panic
+        let token_client = TokenClient::new(&env, &token);
+        let before = token_client.balance(&hunter);
+        assert!(client.try_release_bounty(&id).is_err());
+        assert_eq!(token_client.balance(&hunter), before);
+        assert!(client.get_bounty(&id).released);
     }
 }
+
+#[cfg(test)]
+mod compatibility_tests;
