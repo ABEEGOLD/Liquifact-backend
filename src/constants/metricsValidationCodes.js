@@ -10,50 +10,15 @@
  * configuration, storage, escrow, SME, webhooks, metrics auth) defines its
  * codes here so that:
  *
- *   - Callers compare against named constants, not magic strings.
- *   - No two domains accidentally share a code string (enforced by uniqueness
- *     checks in the test suite).
- *   - The set of codes is deterministic and immutable at runtime — an attempt
- *     to add, delete, or mutate a code after import throws in strict mode.
+ * ## Compatibility contract
+ * This module guarantees:
+ * - All exported symbols are present and have the expected types at runtime
+ * - The codes object is frozen and cannot be mutated
+ * - Each code value equals its key (self-describing on the wire)
+ * - The top-level error code and problem type URI are stable
+ * - Adding new codes is backward-compatible (existing callers unaffected)
+ * - Removing or renaming codes is a breaking change (requires major version bump)
  *
- * ## Immutability invariant
- *
- * Every exported group object and the top-level `VALIDATION_CODES` registry
- * are sealed with `Object.freeze()`.  This means:
- *
- *   - In strict mode (`'use strict'`), writing to a frozen property throws a
- *     `TypeError` immediately — callers cannot silently widen or overwrite codes.
- *   - In sloppy mode, the write is silently ignored.  The frozen guard is
- *     belt-and-suspenders documentation as much as it is a runtime guard.
- *   - `Object.isFrozen()` returns `true` for every exported constant, which
- *     the test suite asserts explicitly.
- *
- * ## How to add a new code
- *
- * 1. Add the constant to the relevant domain group below.
- * 2. Update the corresponding `@property` JSDoc on the group.
- * 3. The uniqueness test in `tests/unit/metricsValidationCodes.test.js` will
- *    catch any accidental collision with an existing code in another domain.
- *
- * ## How callers import codes
- *
- * ```js
- * // Import a specific domain group:
- * const { INVOICE_SM_CODES } = require('../constants/metricsValidationCodes');
- * throw Object.assign(new Error('bad state'), { code: INVOICE_SM_CODES.INVALID_TRANSITION });
- *
- * // Import the flat registry:
- * const { VALIDATION_CODES } = require('../constants/metricsValidationCodes');
- * if (err.code === VALIDATION_CODES.INVALID_TRANSITION) { ... }
- * ```
- *
- * ## Determinism guarantees
- * The classification in {@link codeForIssue} is a pure function of the issue
- * object: it never consults mutable module state, the clock, or the network,
- * and it never throws. The same input always yields the same code, which is
- * what makes failure recovery replayable and observable.
- *
- * @defines {string} MetricsValidationCode
  * @module constants/metricsValidationCodes
  */
 
@@ -71,7 +36,15 @@
 // ---------------------------------------------------------------------------
 
 /**
- * Validation codes owned by the invoice state-machine layer.
+ * Version of the validation code taxonomy.
+ * Increment when adding new codes. Increment major when removing/renaming codes.
+ *
+ * @type {string}
+ */
+const METRICS_VALIDATION_CODES_VERSION = '1.0.0';
+
+/**
+ * Bounded set of per-issue validation codes.
  *
  * @param {string} MetricsValidationCode
  * @readonly
@@ -366,13 +339,103 @@ function codesForError(error) {
   return out;
 }
 
+/**
+ * Validates that the module exports satisfy the compatibility contract.
+ *
+ * This function runs at module load time to ensure:
+ * - All expected exports are present
+ * - Exports have the correct types
+ * - The codes object is frozen
+ * - Code values are stable (key equals value)
+ *
+ * @throws {Error} If any compatibility contract is violated.
+ * @returns {void}
+ */
+function validateCompatibilityContract() {
+  // Validate METRICS_VALIDATION_CODES is frozen
+  if (!Object.isFrozen(METRICS_VALIDATION_CODES)) {
+    throw new Error(
+      '[metricsValidationCodes] METRICS_VALIDATION_CODES must be frozen to prevent runtime mutations.'
+    );
+  }
+
+  // Validate each code value equals its key (self-describing)
+  for (const [key, value] of Object.entries(METRICS_VALIDATION_CODES)) {
+    if (value !== key) {
+      throw new Error(
+        `[metricsValidationCodes] Code value must equal its key for wire stability. Got key="${key}", value="${value}"`
+      );
+    }
+  }
+
+  // Validate KNOWN_CODES Set contains all code values
+  for (const value of Object.values(METRICS_VALIDATION_CODES)) {
+    if (!KNOWN_CODES.has(value)) {
+      throw new Error(
+        `[metricsValidationCodes] KNOWN_CODES Set is missing code value "${value}"`
+      );
+    }
+  }
+
+  // Validate top-level constants are strings
+  if (typeof METRICS_VALIDATION_ERROR_CODE !== 'string') {
+    throw new Error(
+      '[metricsValidationCodes] METRICS_VALIDATION_ERROR_CODE must be a string.'
+    );
+  }
+
+  if (typeof METRICS_VALIDATION_PROBLEM_TYPE !== 'string') {
+    throw new Error(
+      '[metricsValidationCodes] METRICS_VALIDATION_PROBLEM_TYPE must be a string.'
+    );
+  }
+
+  // Validate problem type URI is a valid URI format
+  if (!METRICS_VALIDATION_PROBLEM_TYPE.startsWith('https://')) {
+    throw new Error(
+      '[metricsValidationCodes] METRICS_VALIDATION_PROBLEM_TYPE must be an HTTPS URI.'
+    );
+  }
+
+  // Validate codeForIssue is a function
+  if (typeof codeForIssue !== 'function') {
+    throw new Error(
+      '[metricsValidationCodes] codeForIssue must be a function.'
+    );
+  }
+
+  // Validate codeForIssue returns known codes for all known issue codes
+  const testCases = [
+    { code: 'invalid_type', received: 'undefined' },
+    { code: 'invalid_type', received: 'number' },
+    { code: 'unrecognized_keys', keys: [] },
+    { code: 'too_small', origin: 'string' },
+    { code: 'too_big', origin: 'string' },
+    { code: 'too_small', origin: 'array' },
+    { code: 'too_big', origin: 'array' },
+    { code: 'too_small', origin: 'number' },
+    { code: 'too_big', origin: 'number' },
+    { code: 'not_multiple_of' },
+    { code: 'invalid_format' },
+  ];
+
+  for (const testCase of testCases) {
+    const result = codeForIssue(testCase);
+    if (!KNOWN_CODES.has(result)) {
+      throw new Error(
+        `[metricsValidationCodes] codeForIssue returned unknown code "${result}" for issue ${JSON.stringify(testCase)}`
+      );
+    }
+  }
+}
+
+// Run compatibility validation at module load time
+validateCompatibilityContract();
+
 module.exports = {
-  INVOICE_SM_CODES,
-  CONFIG_CODES,
-  STORAGE_CODES,
-  ESCROW_CODES,
-  SME_CODES,
-  WEBHOOK_CODES,
-  METRICS_AUTH_CODES,
-  VALIDATION_CODES,
+  METRICS_VALIDATION_CODES,
+  METRICS_VALIDATION_ERROR_CODE,
+  METRICS_VALIDATION_PROBLEM_TYPE,
+  codeForIssue,
+  METRICS_VALIDATION_CODES_VERSION,
 };
