@@ -269,14 +269,10 @@ function _getConfig() {
  */
 function resolveThresholds(tenantId) {
   const { defaults, tenants } = _getConfig();
+  const tenantKey = tenantId === undefined || tenantId === null ? null : String(tenantId);
 
-  if (tenantId !== undefined && tenantId !== null) {
-    const key = String(tenantId);
-    if (tenants.has(key)) {
-      // Defensive copy: callers cannot mutate the frozen cached entry, and the
-      // returned object is a fresh plain object (invariant I4).
-      return { ...tenants.get(key) };
-    }
+  if (tenantKey !== null && tenants.has(tenantKey)) {
+    return { ...tenants.get(tenantKey) };
   }
 
   // Defensive copy of the frozen defaults (invariant I4).
