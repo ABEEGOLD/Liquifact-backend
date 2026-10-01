@@ -335,15 +335,11 @@ impl BountyContract {
         env.storage()
             .instance()
             .set(&DataKey::FeeRecipient, &fee_recipient);
-
-        // Only seed the counter when it is absent. A pre-existing counter can
-        // only come from state written by an earlier contract version, and
-        // resetting it to 0 would re-issue ids that escrowed bounties hold.
+        // Legacy callers may create bounties before initialization. Preserve their
+        // counter instead of resetting it and overwriting already funded escrow.
         if !env.storage().instance().has(&DataKey::NextId) {
             env.storage().instance().set(&DataKey::NextId, &0u64);
         }
-
-        Ok(())
     }
 
     /// Create a bounty.
@@ -363,32 +359,39 @@ impl BountyContract {
         open_bounty(&env, creator, hunter, token, amount, protocol_fee_bps, None)
     }
 
-    /// Create a bounty with replay protection.
-    ///
-    /// `key` is a caller-chosen 32-byte value that makes the call idempotent:
-    /// repeating it with the same parameters returns the original id without
-    /// escrowing again, and repeating it with different parameters is rejected
-    /// with [`BountyError::IdempotencyKeyReuse`]. This is what makes a retried
-    /// submission safe; `create_bounty` cannot dedupe because two identical
-    /// bounties are a legitimate request.
-    pub fn create_bounty_with_key(
-        env: Env,
-        creator: Address,
-        hunter: Address,
-        token: Address,
-        amount: i128,
-        protocol_fee_bps: u32,
-        key: BytesN<32>,
-    ) -> Result<u64, BountyError> {
-        open_bounty(
-            &env,
+        assert!(amount > 0,           "amount must be positive");
+        assert!(protocol_fee_bps <= 10_000, "fee_bps must be <= 10000");
+
+        let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
+        let next_id = id.checked_add(1).expect("bounty id exhausted");
+        // Never replace a legacy bounty if a counter is missing or inconsistent.
+        // Check before interacting with the token, and keep the existing keys.
+        assert!(
+            !env.storage().persistent().has(&DataKey::Bounty(id)),
+            "bounty id already exists"
+        );
+
+        // Pull funds into the contract.
+        let client = token::Client::new(&env, &token);
+        client.transfer(&creator, &env.current_contract_address(), &amount);
+
+        let bounty = Bounty {
             creator,
             hunter,
             token,
             amount,
             protocol_fee_bps,
-            Some(key),
-        )
+            released: false,
+        };
+        env.storage().persistent().set(&DataKey::Bounty(id), &bounty);
+        env.storage().instance().set(&DataKey::NextId, &next_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "bounty_created"), id),
+            amount,
+        );
+
+        id
     }
 
     /// Release a bounty to the hunter, deducting the protocol fee first.
@@ -467,8 +470,26 @@ impl BountyContract {
             &bounty.amount,
         );
 
-        bounty.refunded = true;
+        // Validate persisted records too: upgrades must not turn malformed legacy
+        // data into negative payouts or mint-like token transfers.
+        assert!(bounty.amount > 0, "amount must be positive");
+        assert!(bounty.protocol_fee_bps <= 10_000, "fee_bps must be <= 10000");
+
+        // Same floor(amount * bps / 10_000), without overflowing for valid i128
+        // amounts. Both products are bounded when amount > 0 and bps <= 10_000.
+        let bps = i128::from(bounty.protocol_fee_bps);
+        let fee = (bounty.amount / 10_000) * bps + ((bounty.amount % 10_000) * bps) / 10_000;
+        let payout: i128 = bounty.amount - fee;
+
+        // Reserve the release before external calls. Soroban invocation rollback
+        // restores this flag, balances and events if either transfer fails.
+        bounty.released = true;
         env.storage().persistent().set(&DataKey::Bounty(id), &bounty);
+
+        if fee > 0 {
+            client.transfer(&env.current_contract_address(), &fee_recipient, &fee);
+        }
+        client.transfer(&env.current_contract_address(), &bounty.hunter, &payout);
 
         env.events().publish(
             (Symbol::new(&env, "bounty_refunded"), id),
@@ -630,7 +651,7 @@ mod tests {
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
-    fn setup() -> (Env, Address, Address, Address, Address, Address) {
+    pub(super) fn setup() -> (Env, Address, Address, Address, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -1172,516 +1193,13 @@ mod tests {
         let id = client.create_bounty(&creator, &hunter, &token, &500_i128, &0u32);
         let hunter_before = token_client.balance(&hunter);
         client.release_bounty(&id);
-
-        assert_eq!(
-            contract_error(client.try_release_bounty(&id)),
-            BountyError::AlreadyReleased
-        );
-        assert_eq!(
-            token_client.balance(&hunter) - hunter_before,
-            500_i128,
-            "the rejected replay must not pay out again"
-        );
-        assert_eq!(token_client.balance(&contract_id), 0_i128);
-    }
-
-    // ── idempotent creation ──────────────────────────────────────────────────
-
-    /// A retried submission must not escrow twice.
-    #[test]
-    fn test_create_with_key_replays_without_second_escrow() {
-        let (env, contract_id, _fee_recipient, creator, hunter, token) = setup();
-        let client = BountyContractClient::new(&env, &contract_id);
-        let token_client = TokenClient::new(&env, &token);
-        let creator_before = token_client.balance(&creator);
-
-        let id = client.create_bounty_with_key(
-            &creator,
-            &hunter,
-            &token,
-            &500_i128,
-            &100u32,
-            &key(&env, 1),
-        );
-        let replayed = client.create_bounty_with_key(
-            &creator,
-            &hunter,
-            &token,
-            &500_i128,
-            &100u32,
-            &key(&env, 1),
-        );
-
-        assert_eq!(replayed, id);
-        assert_eq!(client.bounty_count(), 1, "the replay created no bounty");
-        assert_eq!(
-            token_client.balance(&creator),
-            creator_before - 500_i128,
-            "the replay moved no funds"
-        );
-        assert_eq!(token_client.balance(&contract_id), 500_i128);
-    }
-
-    /// The same request under a different key is a legitimate second bounty.
-    #[test]
-    fn test_distinct_keys_create_distinct_bounties() {
-        let (env, contract_id, _fee_recipient, creator, hunter, token) = setup();
-        let client = BountyContractClient::new(&env, &contract_id);
-
-        let first = client.create_bounty_with_key(
-            &creator,
-            &hunter,
-            &token,
-            &500_i128,
-            &0u32,
-            &key(&env, 1),
-        );
-        let second = client.create_bounty_with_key(
-            &creator,
-            &hunter,
-            &token,
-            &500_i128,
-            &0u32,
-            &key(&env, 2),
-        );
-
-        assert_ne!(first, second);
-        assert_eq!(client.bounty_count(), 2);
-    }
-
-    /// A key is a promise about one request; reusing it for another is refused
-    /// and leaves the original bounty untouched.
-    #[test]
-    fn test_create_with_key_rejects_changed_parameters() {
-        let (env, contract_id, _fee_recipient, creator, hunter, token) = setup();
-        let client = BountyContractClient::new(&env, &contract_id);
-        let token_client = TokenClient::new(&env, &token);
-
-        let id = client.create_bounty_with_key(
-            &creator,
-            &hunter,
-            &token,
-            &500_i128,
-            &100u32,
-            &key(&env, 1),
-        );
-        let original = client.get_bounty(&id);
-
-        for (amount, bps) in [(501_i128, 100_u32), (500, 200)] {
-            assert_eq!(
-                contract_error(client.try_create_bounty_with_key(
-                    &creator,
-                    &hunter,
-                    &token,
-                    &amount,
-                    &bps,
-                    &key(&env, 1)
-                )),
-                BountyError::IdempotencyKeyReuse
-            );
-        }
-        let other_hunter = Address::generate(&env);
-        assert_eq!(
-            contract_error(client.try_create_bounty_with_key(
-                &creator,
-                &other_hunter,
-                &token,
-                &500_i128,
-                &100u32,
-                &key(&env, 1)
-            )),
-            BountyError::IdempotencyKeyReuse
-        );
-
-        assert_eq!(client.bounty_count(), 1);
-        assert_eq!(client.get_bounty(&id), original);
-        assert_eq!(token_client.balance(&contract_id), 500_i128);
-    }
-
-    /// A replay after the bounty was released still returns the original id and
-    /// still cannot move funds.
-    #[test]
-    fn test_create_with_key_replay_after_release() {
-        let (env, contract_id, _fee_recipient, creator, hunter, token) = setup();
-        let client = BountyContractClient::new(&env, &contract_id);
-        let token_client = TokenClient::new(&env, &token);
-
-        let id = client.create_bounty_with_key(
-            &creator,
-            &hunter,
-            &token,
-            &500_i128,
-            &0u32,
-            &key(&env, 7),
-        );
-        client.release_bounty(&id);
-        let hunter_before = token_client.balance(&hunter);
-
-        let replayed = client.create_bounty_with_key(
-            &creator,
-            &hunter,
-            &token,
-            &500_i128,
-            &0u32,
-            &key(&env, 7),
-        );
-
-        assert_eq!(replayed, id);
-        assert!(client.get_bounty(&id).released);
-        assert_eq!(client.bounty_count(), 1);
-        assert_eq!(token_client.balance(&hunter), hunter_before);
-    }
-
-    /// Without a key, an identical request is a new bounty: callers that retry
-    /// blindly must opt in to `create_bounty_with_key`.
-    #[test]
-    fn test_create_bounty_does_not_deduplicate() {
-        let (env, contract_id, _fee_recipient, creator, hunter, token) = setup();
-        let client = BountyContractClient::new(&env, &contract_id);
-
-        let first = client.create_bounty(&creator, &hunter, &token, &500_i128, &0u32);
-        let second = client.create_bounty(&creator, &hunter, &token, &500_i128, &0u32);
-
-        assert_ne!(first, second);
-        assert_eq!(client.bounty_count(), 2);
-    }
-
-    // ── failure and retry ────────────────────────────────────────────────────
-
-    /// A token that reverts must leave no trace: no bounty, no consumed id, and
-    /// no partial escrow. The creator can retry once the token recovers.
-    #[test]
-    fn test_failed_create_leaves_no_partial_state() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, BountyContract);
-        let fee_recipient = Address::generate(&env);
-        let creator = Address::generate(&env);
-        let hunter = Address::generate(&env);
-        let token_id = env.register_contract(None, MockToken);
-        let token = MockTokenClient::new(&env, &token_id);
-        token.mint(&creator, &1_000_i128);
-
-        let client = BountyContractClient::new(&env, &contract_id);
-        client.initialize(&fee_recipient);
-
-        token.arm(&1, &0, &creator);
-        assert!(
-            client
-                .try_create_bounty_with_key(
-                    &creator,
-                    &hunter,
-                    &token_id,
-                    &500_i128,
-                    &0u32,
-                    &key(&env, 3)
-                )
-                .is_err(),
-            "a reverting token must fail the creation"
-        );
-
-        assert_eq!(client.bounty_count(), 0, "the reserved id was rolled back");
-        assert!(client.find_bounty(&0).is_none());
-        assert_eq!(
-            token.balance(&contract_id),
-            0_i128,
-            "no funds were escrowed"
-        );
-        assert_eq!(token.balance(&creator), 1_000_i128);
-
-        // The key was not burned by the failed attempt: the retry succeeds.
-        token.arm(&0, &0, &creator);
-        let id = client.create_bounty_with_key(
-            &creator,
-            &hunter,
-            &token_id,
-            &500_i128,
-            &0u32,
-            &key(&env, 3),
-        );
-        assert_eq!(id, 0);
-        assert_eq!(token.balance(&contract_id), 500_i128);
-        client.release_bounty(&id);
-        assert_eq!(token.balance(&hunter), 500_i128);
-    }
-
-    /// A release that fails must leave the bounty releasable, and the retry must
-    /// pay out exactly once.
-    #[test]
-    fn test_failed_release_can_be_retried_once() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, BountyContract);
-        let fee_recipient = Address::generate(&env);
-        let creator = Address::generate(&env);
-        let hunter = Address::generate(&env);
-        let token_id = env.register_contract(None, MockToken);
-        let token = MockTokenClient::new(&env, &token_id);
-        token.mint(&creator, &1_000_i128);
-
-        let client = BountyContractClient::new(&env, &contract_id);
-        client.initialize(&fee_recipient);
-        let id = client.create_bounty(&creator, &hunter, &token_id, &500_i128, &0u32);
-
-        token.arm(&1, &0, &creator);
-        assert!(client.try_release_bounty(&id).is_err());
-
-        assert!(
-            !client.get_bounty(&id).released,
-            "a failed release must stay pending"
-        );
-        assert_eq!(token.balance(&contract_id), 500_i128, "escrow is untouched");
-        assert_eq!(token.balance(&hunter), 0_i128);
-
-        token.arm(&0, &0, &creator);
-        client.release_bounty(&id);
-
-        assert!(client.get_bounty(&id).released);
-        assert_eq!(token.balance(&hunter), 500_i128, "paid exactly once");
-        assert_eq!(token.balance(&contract_id), 0_i128);
-        assert_eq!(
-            contract_error(client.try_release_bounty(&id)),
-            BountyError::AlreadyReleased
-        );
-    }
-
-    // ── re-entrancy ──────────────────────────────────────────────────────────
-
-    /// A token that calls back into `release_bounty` cannot pay the hunter twice.
-    ///
-    /// The Soroban host refuses re-entry into a contract that is already on the
-    /// call stack, so the callback is rejected; `released` is persisted before
-    /// the transfers for the same reason.
-    #[test]
-    fn test_reentrant_release_cannot_double_pay() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, BountyContract);
-        let fee_recipient = Address::generate(&env);
-        let creator = Address::generate(&env);
-        let hunter = Address::generate(&env);
-        let token_id = env.register_contract(None, MockToken);
-        let token = MockTokenClient::new(&env, &token_id);
-        token.mint(&creator, &1_000_i128);
-
-        let client = BountyContractClient::new(&env, &contract_id);
-        client.initialize(&fee_recipient);
-        let id = client.create_bounty(&creator, &hunter, &token_id, &500_i128, &0u32);
-
-        token.arm(&2, &id, &creator);
-        client.release_bounty(&id);
-
-        assert_eq!(token.reentry_outcome(), 2, "the callback was rejected");
-        assert_eq!(token.balance(&hunter), 500_i128, "paid exactly once");
-        assert_eq!(token.balance(&contract_id), 0_i128);
-        assert_eq!(
-            contract_error(client.try_release_bounty(&id)),
-            BountyError::AlreadyReleased
-        );
-    }
-
-    /// A token that calls back into `create_bounty` cannot make the escrow
-    /// inconsistent: the re-entrant invocation is refused by the host and the
-    /// outer call is rolled back whole.
-    #[test]
-    fn test_reentrant_create_cannot_split_an_escrow() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, BountyContract);
-        let fee_recipient = Address::generate(&env);
-        let creator = Address::generate(&env);
-        let hunter = Address::generate(&env);
-        let token_id = env.register_contract(None, MockToken);
-        let token = MockTokenClient::new(&env, &token_id);
-        token.mint(&creator, &1_000_i128);
-        token.mint(&fee_recipient, &1_000_i128);
-
-        let client = BountyContractClient::new(&env, &contract_id);
-        client.initialize(&fee_recipient);
-
-        token.arm(&3, &0, &creator);
-        assert!(client
-            .try_create_bounty(&creator, &hunter, &token_id, &500_i128, &0u32)
-            .is_err());
-
-        assert_eq!(client.bounty_count(), 0, "no id was consumed");
-        assert!(client.find_bounty(&0).is_none());
-        assert_eq!(
-            token.balance(&contract_id),
-            0_i128,
-            "both transfers were rolled back"
-        );
-        assert_eq!(token.balance(&creator), 1_000_i128);
-    }
-
-    // ── id allocation ───────────────────────────────────────────────────────
-
-    /// Boundary: the id space is finite and exhaustion is a typed error rather
-    /// than an overflow trap.
-    #[test]
-    fn test_create_reports_exhausted_id_space() {
-        let (env, contract_id, _fee_recipient, creator, hunter, token) = setup();
-        let client = BountyContractClient::new(&env, &contract_id);
-
-        env.as_contract(&contract_id, || {
-            env.storage().instance().set(&DataKey::NextId, &u64::MAX);
-        });
-
-        assert_eq!(
-            contract_error(client.try_create_bounty(&creator, &hunter, &token, &500_i128, &0u32)),
-            BountyError::IdSpaceExhausted
-        );
-    }
-
-    /// Boundary: a counter pointing at a live bounty must never overwrite it.
-    #[test]
-    fn test_create_refuses_to_overwrite_an_existing_bounty() {
-        let (env, contract_id, _fee_recipient, creator, hunter, token) = setup();
-        let client = BountyContractClient::new(&env, &contract_id);
-
-        let id = client.create_bounty(&creator, &hunter, &token, &500_i128, &0u32);
-        let original = client.get_bounty(&id);
-
-        env.as_contract(&contract_id, || {
-            env.storage().instance().set(&DataKey::NextId, &id);
-        });
-
-        assert_eq!(
-            contract_error(client.try_create_bounty(&creator, &hunter, &token, &900_i128, &0u32)),
-            BountyError::IdCollision
-        );
-        assert_eq!(client.get_bounty(&id), original);
-    }
-
-    /// Migration path: an instance upgraded over existing state keeps handing
-    /// out ids after the ones already escrowed, instead of restarting at 0.
-    #[test]
-    fn test_initialize_preserves_an_existing_id_counter() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, BountyContract);
-        let fee_recipient = Address::generate(&env);
-        let creator = Address::generate(&env);
-        let hunter = Address::generate(&env);
-        let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
-        let token = token_id.address();
-        StellarAssetClient::new(&env, &token).mint(&creator, &1_000_i128);
-
-        // State left behind by an earlier version: bounties exist and the
-        // counter has advanced, but the fee recipient is missing.
-        env.as_contract(&contract_id, || {
-            env.storage().instance().set(&DataKey::NextId, &7u64);
-            env.storage().persistent().set(
-                &DataKey::Bounty(6),
-                &Bounty {
-                    creator: creator.clone(),
-                    hunter: hunter.clone(),
-                    token: token.clone(),
-                    amount: 42_i128,
-                    protocol_fee_bps: 0,
-                    released: false,
-                },
-            );
-        });
-
-        let client = BountyContractClient::new(&env, &contract_id);
-        client.initialize(&fee_recipient);
-
-        let id = client.create_bounty(&creator, &hunter, &token, &500_i128, &0u32);
-        assert_eq!(id, 7, "the counter must not restart");
-        assert_eq!(client.get_bounty(&6).amount, 42_i128, "escrow survives");
-        assert_eq!(client.bounty_count(), 8);
-    }
-
-    // ── observability ────────────────────────────────────────────────────────
-
-    /// A creation publishes exactly one `bounty_created` event with the escrowed
-    /// amount, so an indexer can reconcile escrows against on-chain ids.
-    #[test]
-    fn test_create_publishes_an_event() {
-        let (env, contract_id, _fee_recipient, creator, hunter, token) = setup();
-        let client = BountyContractClient::new(&env, &contract_id);
-
-        let before = env.events().all().len();
-        client.create_bounty(&creator, &hunter, &token, &1_234_i128, &0u32);
-
-        let mut published = 0;
-        for (address, topics, data) in env.events().all().iter() {
-            if address != contract_id {
-                continue;
-            }
-            published += 1;
-            assert_eq!(topics.len(), 2, "event topics: [symbol, id]");
-            let name: Symbol = Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap();
-            assert_eq!(name, Symbol::new(&env, "bounty_created"));
-            let id: u64 = u64::try_from_val(&env, &topics.get(1).unwrap()).unwrap();
-            assert_eq!(id, 0, "the event carries the bounty id");
-            let escrowed: i128 = i128::try_from_val(&env, &data).unwrap();
-            assert_eq!(escrowed, 1_234_i128, "event data: escrowed amount");
-        }
-        assert_eq!(published, 1, "exactly one event per creation");
-        // Two events in total: the mock token's `transfer` and the bounty's own.
-        assert_eq!(env.events().all().len(), before + 2);
-    }
-
-    // ── failure-recovery / determinism ───────────────────────────────────────
-
-    #[test]
-    fn test_release_record_cleared_after_success() {
-        let (env, contract_id, _fee_recipient, creator, hunter, token) = setup();
-        let client = BountyContractClient::new(&env, &contract_id);
-        let id = client.create_bounty(&creator, &hunter, &token, &1_000_i128, &100u32);
-
-        assert!(client.get_release_record(&id).is_none());
-        client.release_bounty(&id);
-        assert!(client.get_release_record(&id).is_none(), "record must be cleared on success");
-    }
-
-    #[test]
-    fn test_zero_fee_release_is_deterministic() {
-        let (env, contract_id, _fee_recipient, creator, hunter, token) = setup();
-        let client = BountyContractClient::new(&env, &contract_id);
-        let id = client.create_bounty(&creator, &hunter, &token, &1_000_i128, &0u32);
-
         let token_client = TokenClient::new(&env, &token);
         let before = token_client.balance(&hunter);
-        client.release_bounty(&id);
-        let after = token_client.balance(&hunter);
-
-        assert_eq!(after - before, 1_000_i128);
-        assert!(client.get_release_record(&id).is_none());
-    }
-
-    #[test]
-    #[should_panic(expected = "creator and hunter must differ")]
-    fn test_rejects_self_bounty() {
-        let (env, contract_id, _fee_recipient, creator, _hunter, token) = setup();
-        let client = BountyContractClient::new(&env, &contract_id);
-        client.create_bounty(&creator, &creator, &token, &100_i128, &0u32);
-    }
-
-    #[test]
-    #[should_panic(expected = "amount must be positive")]
-    fn test_rejects_zero_amount() {
-        let (env, contract_id, _fee_recipient, creator, hunter, token) = setup();
-        let client = BountyContractClient::new(&env, &contract_id);
-        client.create_bounty(&creator, &hunter, &token, &0_i128, &0u32);
-    }
-
-    #[test]
-    #[should_panic(expected = "fee_bps must be <= 10000")]
-    fn test_rejects_excessive_fee() {
-        let (env, contract_id, _fee_recipient, creator, hunter, token) = setup();
-        let client = BountyContractClient::new(&env, &contract_id);
-        client.create_bounty(&creator, &hunter, &token, &100_i128, &10_001u32);
-    }
-
-    #[test]
-    #[should_panic(expected = "bounty not found")]
-    fn test_release_unknown_bounty_panics() {
-        let (env, contract_id, _fee_recipient, _creator, _hunter, _token) = setup();
-        let client = BountyContractClient::new(&env, &contract_id);
-        client.release_bounty(&999u64);
+        assert!(client.try_release_bounty(&id).is_err());
+        assert_eq!(token_client.balance(&hunter), before);
+        assert!(client.get_bounty(&id).released);
     }
 }
+
+#[cfg(test)]
+mod compatibility_tests;
