@@ -8,6 +8,7 @@ const {
   toConfigSectionsResponseDto,
   fromConfigSectionsResponseDto,
 } = require('../../src/dto/config');
+const { CONFIG_SECTIONS } = require('../../src/schemas/config');
 
 describe('admin config DTO mapping', () => {
   it('round-trips admin config request payloads through the request DTO layer', () => {
