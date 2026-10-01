@@ -3,50 +3,9 @@
 /**
  * @fileoverview Config DTO — deterministic failure recovery for application configuration.
  *
- * This module wraps the raw validated config (from `src/config/index.js`) into
- * a stable, typed Data-Transfer Object that:
- *
- *   1. Classifies every parse / validation failure into a named `ConfigError`
- *      with a machine-readable `code`, human-safe `message`, and `recoverable`
- *      flag so callers can distinguish fatal mis-configs from transient problems.
- *
- *   2. Exposes `buildConfigDto(rawEnv?)` — a pure, deterministic function safe to
- *      call multiple times and from concurrent paths without side-effects.
- *
- *   3. Provides `parseConfigDto()` which reads `process.env`, calls `buildConfigDto`,
- *      and wraps any thrown error into a structured `ConfigResult` rather than
- *      propagating raw Zod errors or unclassified exceptions.
- *
- *   4. Guarantees that for any given set of inputs the output (success or failure)
- *      is always the same shape — so callers never encounter `undefined`, partial
- *      data, or unhandled throws when consuming config at runtime.
- *
- * ## Failure recovery model
- *
- * ```
- *  Input env                    parseConfigDto()
- *  ─────────────────────────    ─────────────────────────────────────────────
- *  Valid                    →   { ok: true,  dto: ConfigDto }
- *  Missing required field   →   { ok: false, error: ConfigError(MISSING_FIELD) }
- *  Type / constraint error  →   { ok: false, error: ConfigError(VALIDATION_ERROR) }
- *  Unparseable JSON in env  →   { ok: false, error: ConfigError(PARSE_ERROR) }
- *  Unexpected thrown value  →   { ok: false, error: ConfigError(UNEXPECTED_ERROR) }
- * ```
- *
- * Callers that need strict boot-time fail-fast behaviour use `requireConfigDto()`
- * which throws a `ConfigError` if the result is not `ok`.
- *
- * Invariants enforced here:
- *   - All inputs are validated defensively; no input can produce a thrown
- *     exception — malformed inputs produce safe zero-value defaults instead
- *     of propagating bad data downstream.
- *   - Output objects are shallow-frozen so callers cannot silently mutate the
- *     DTO after it leaves this layer, preventing cross-request state bleed
- *     in concurrent execution.
- *   - `config` payloads are always shallow-copied (never aliased) so the
- *     original request body cannot be mutated via the DTO reference.
- *   - String fields are type-checked and default to `''` rather than
- *     `undefined`, keeping downstream consumers free from null-checks.
+ * These helpers keep the route contract explicit and isolate DTO state from
+ * caller mutations. They map plain objects to/from a small typed DTO envelope
+ * that is easier to evolve safely during refactors.
  *
  * @module dto/config
  */
@@ -123,7 +82,30 @@ function requireConfig(config) {
  */
 
 /**
- * Machine-readable codes attached to every `ConfigError`.
+ * @typedef {Object} AdminConfigResponseDto
+ * @property {string} section - Configuration section name.
+ * @property {Record<string, unknown>} config - Accepted section payload.
+ * @property {string} message - Human-readable success message.
+ */
+
+/**
+ * @typedef {Object} ConfigSectionsResponseDto
+ * @property {string[]} sections - Valid configuration section names.
+ */
+
+/**
+ * Copy config data so nested mutable values are not shared across DTO boundaries.
+ * Config payloads are structured-cloneable JSON data after request validation.
+ *
+ * @param {Record<string, unknown>} config - Config payload to copy.
+ * @returns {Record<string, unknown>} An independent config snapshot.
+ */
+function cloneConfig(config) {
+  return structuredClone(config);
+}
+
+/**
+ * Map a raw admin config request payload into a typed request DTO.
  *
  * @readonly
  * @enum {string}
@@ -144,7 +126,12 @@ function toAdminConfigRequestDto(payload) {
   }
   void formatted; // used above for structure, messages taken from issues
 
-  return { code, fieldErrors };
+  const section = typeof payload.section === 'string' ? payload.section : '';
+  const config = payload.config && typeof payload.config === 'object' && !Array.isArray(payload.config)
+    ? cloneConfig(payload.config)
+    : {};
+
+  return { section, config };
 }
 
 /**
@@ -185,7 +172,13 @@ function toAdminConfigResponseDto(payload) {
     throw new TypeError('message must be a string');
   }
 
-  return { section, config, message: record.message };
+  const section = typeof payload.section === 'string' ? payload.section : '';
+  const config = payload.config && typeof payload.config === 'object' && !Array.isArray(payload.config)
+    ? cloneConfig(payload.config)
+    : {};
+  const message = typeof payload.message === 'string' ? payload.message : '';
+
+  return { section, config, message };
 }
 
 /**

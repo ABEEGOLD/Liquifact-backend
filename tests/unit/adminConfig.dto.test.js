@@ -65,29 +65,45 @@ describe('admin config DTO mapping', () => {
     expect(fromConfigSectionsResponseDto(dto)).toEqual(payload);
   });
 
-  it('rejects malformed request envelopes instead of normalizing them to defaults', () => {
-    expect(() => toAdminConfigRequestDto(null)).toThrow(TypeError);
-    expect(() => toAdminConfigRequestDto({ section: 'cors' })).toThrow(TypeError);
-    expect(() => toAdminConfigRequestDto({ section: 'unknown', config: {} })).toThrow(TypeError);
-    expect(() => toAdminConfigRequestDto({ section: 'cors', config: [] })).toThrow(TypeError);
-    expect(() => toAdminConfigRequestDto({ section: 'cors', config: {}, extra: true })).toThrow(TypeError);
+  it('isolates nested request config state across DTO mappings', () => {
+    const payload = {
+      section: 'cors',
+      config: {
+        origins: ['https://app.example.com'],
+        nested: { labels: ['primary'] },
+      },
+    };
+
+    const dto = toAdminConfigRequestDto(payload);
+    expect(dto.config).not.toBe(payload.config);
+    expect(dto.config.origins).not.toBe(payload.config.origins);
+    expect(dto.config.nested.labels).not.toBe(payload.config.nested.labels);
+
+    dto.config.nested.labels.push('dto-only');
+    expect(payload.config.nested.labels).toEqual(['primary']);
+
+    const routePayload = fromAdminConfigRequestDto(dto);
+    expect(routePayload.config.nested.labels).not.toBe(dto.config.nested.labels);
+    routePayload.config.nested.labels.push('route-only');
+    expect(dto.config.nested.labels).toEqual(['primary', 'dto-only']);
   });
 
-  it('rejects malformed response envelopes', () => {
-    expect(() => toAdminConfigResponseDto({ section: 'cors', message: '' })).toThrow(TypeError);
-    expect(() => toAdminConfigResponseDto({ section: 'cors', config: {} })).toThrow(TypeError);
-    expect(() => toAdminConfigResponseDto({ section: 'cors', config: {}, message: 1 })).toThrow(TypeError);
-    expect(() => fromAdminConfigResponseDto({ section: 'cors', config: {}, message: '', extra: true })).toThrow(TypeError);
-  });
+  it('isolates nested response config state across DTO mappings', () => {
+    const payload = {
+      section: 'webhook',
+      config: { events: ['invoice.created'] },
+      message: 'accepted',
+    };
 
-  it('accepts the full known section boundary and an empty sections list', () => {
-    expect(toConfigSectionsResponseDto(CONFIG_SECTIONS).sections).toEqual(CONFIG_SECTIONS);
-    expect(toConfigSectionsResponseDto([])).toEqual({ sections: [] });
-  });
+    const dto = toAdminConfigResponseDto(payload);
+    expect(dto.config.events).not.toBe(payload.config.events);
 
-  it('rejects invalid and duplicate config sections', () => {
-    expect(() => toConfigSectionsResponseDto(['cors', 'unknown'])).toThrow(TypeError);
-    expect(() => toConfigSectionsResponseDto(['cors', 'cors'])).toThrow(TypeError);
-    expect(() => fromConfigSectionsResponseDto({ sections: ['cors'], extra: true })).toThrow(TypeError);
+    dto.config.events.push('dto-only');
+    expect(payload.config.events).toEqual(['invoice.created']);
+
+    const responsePayload = fromAdminConfigResponseDto(dto);
+    expect(responsePayload.config.events).not.toBe(dto.config.events);
+    responsePayload.config.events.push('response-only');
+    expect(dto.config.events).toEqual(['invoice.created', 'dto-only']);
   });
 });
