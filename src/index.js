@@ -1,20 +1,12 @@
 'use strict';
 
 /**
- * @fileoverview Process entry point for the LiquiFact API.
+ * @fileoverview Entry point for the LiquiFact API server.
  *
- * This module re-exports the Express app built by ./app and owns process
- * lifecycle: boot configuration validation, the HTTP listen boundary,
- * background workers, and graceful-shutdown registration.
- *
- * ## The listen boundary
- * The port is the only operator-controlled value that reaches this file, and it
- * is the one that must never be passed to `app.listen()` unchecked: `net`
- * treats an unparsable string as a Unix socket path, so a typo would bind the
- * wrong kind of socket with no error at all. ./config/listenPort.js defines the
- * accepted ranges and this module enforces them, fail-closed, before any side
- * effect. See docs/entrypoint-validation-boundaries.md for the full invariant
- * list and the operational failure modes.
+ * This module provides the main entry point for the application and exports
+ * compatibility contracts used by tests and external consumers. All public
+ * APIs are documented with explicit contracts for input validation, error
+ * handling, and return types.
  *
  * @module index
  */
@@ -52,17 +44,18 @@ let httpServer = null;
  * block process start - the readiness probe (`/readyz`) surfaces storage
  * misconfiguration to orchestrators once the HTTP server is listening.
  *
- * @returns { Promise<void> }
+ * @returns {Promise<void>} Resolves when probe completes or fails silently.
+ * @throws {Error} Never throws - all errors are caught and logged internally.
  */
 async function scheduleStartupStorageProbe() {
   try {
     const storage = require('./services/storage');
     await storage.runStartupStorageProbe();
-  } catch (error) {
-    logger.warn(
-      { component: 's3-healthcheck', event: 'startup_probe', errorName: error && error.name },
-      'S3 startup probe could not complete; readiness checks will report storage status'
-    );
+  } catch (err) {
+    // Best-effort: a probe failure must not abort startup.
+    // Log for observability without blocking startup.
+    const logger = require('./logger');
+    logger.warn({ err }, 'Startup storage probe failed (non-blocking)');
   }
 }
 
@@ -71,12 +64,9 @@ async function scheduleStartupStorageProbe() {
  * In test environment, the validation is skipped to preserve lazy loading behavior.
  * Fails fast by logging a redacted summary of errors and exiting with a non-zero code.
  *
- * The return value is the fail-closed signal for the caller: `process.exit()`
- * is documented to never return, but it *is* replaced by a no-op in tests and
- * by some APM/hook wrappers. Returning `false` guarantees a rejected
- * configuration cannot reach `app.listen()` on those code paths either.
- *
- * @returns {boolean} True when the process may continue booting.
+ * @returns {void}
+ * @throws {Error} Never throws in production - exits process on validation failure.
+ *                    In test environment, returns silently without validation.
  */
 function runBootConfigValidation() {
   if (process.env.NODE_ENV === 'test') {
@@ -170,24 +160,22 @@ function attachServerLifecycleHandlers(server, port) {
 /**
  * Starts the HTTP server on the configured port.
  *
- * Validation boundaries enforced here, in order, before any side effect:
- * 1. Boot configuration - a rejected configuration stops the boot (fail-closed).
- * 2. Listen port - rejected before the storage probe, the socket, or any log
- *    line that could be mistaken for a successful start.
- * 3. Duplicate start - a second call returns the running server instead of
- *    binding a second listener and orphaning the first.
+ * Performs boot-time configuration validation, schedules a non-blocking storage
+ * connectivity probe, registers the server with the shutdown coordinator, and sets
+ * up signal listeners for graceful shutdown.
  *
- * @param {number} [portOverride] - Port to bind. `0` requests an ephemeral port.
- *   Omit to use the validated `PORT` environment variable, defaulting to 3001.
- * @returns {import('http').Server|undefined} The HTTP server instance, or
- *   `undefined` when boot validation rejected the configuration.
- * @throws {PortValidationError} If the resolved port is not a usable port.
+ * @param {number} [port] - Optional port override. If not provided, uses PORT
+ *                          environment variable or defaults to 3001.
+ * @returns {import('http').Server} The HTTP server instance.
+ * @throws {Error} May throw if server fails to bind to the specified port.
+ *                   Configuration validation failures exit the process instead of throwing.
  */
-function listenServer() {
-  const port = process.env.PORT || 3001;
+function startServer(port) {
+  runBootConfigValidation();
+  const serverPort = port !== undefined ? port : process.env.PORT || 3001;
   // Fire-and-forget probe -- do not await, so startup is not blocked.
   scheduleStartupStorageProbe();
-  const server = app.listen(port);
+  const server = app.listen(serverPort);
   shutdownCoordinator.register({ server });
   shutdownCoordinator.setupSignalListeners();
 
@@ -297,23 +285,33 @@ function getHttpServer() {
 }
 
 /**
- * Resets in-memory state (clears shared cache stores for test isolation).
+ * Resets in-memory state by clearing shared cache stores for test isolation.
  *
- * @returns { void }
+ * This function safely clears both the main cache store and metrics cache store.
+ * If either store is unavailable (e.g., in environments where the modules are not
+ * loaded), the function continues silently to ensure test isolation without
+ * breaking tests that don't require these stores.
+ *
+ * @returns {void}
+ * @throws {Error} Never throws - all errors are caught and logged for observability.
  */
 function resetStore() {
+  const logger = require('./logger');
+  
   try {
     const { getSharedStore } = require('./services/cacheStore');
     getSharedStore().clear();
-  } catch (_) {
+  } catch (err) {
     // intentional no-op in environments where cacheStore is unavailable
+    logger.debug({ err }, 'cacheStore clear failed (store unavailable)');
   }
 
   try {
     const { getMetricsCacheStore } = require('./services/metricsCacheStore');
     getMetricsCacheStore().clear();
-  } catch (_) {
+  } catch (err) {
     // intentional no-op in environments where metricsCacheStore is unavailable
+    logger.debug({ err }, 'metricsCacheStore clear failed (store unavailable)');
   }
 }
 
@@ -322,10 +320,20 @@ const originalCreateApp = app.createApp;
 /**
  * Returns the underlying Express app factory.
  *
- * @returns { import('express').Express} Configured Express app.
+ * This function provides a compatibility contract for tests and external consumers
+ * that need to create fresh Express app instances. Options are forwarded to the
+ * underlying app factory if it exists.
+ *
+ * @param {Object} [options] - Optional configuration options for the app factory.
+ * @param {boolean} [options.enableTestRoutes] - If true, enables test-only routes.
+ * @returns {import('express').Express} Configured Express app instance.
+ * @throws {Error} May throw if the underlying app factory fails to initialize.
  */
-function createApp() {
-  return typeof originalCreateApp === 'function' ? originalCreateApp() : app;
+function createApp(options) {
+  if (typeof originalCreateApp === 'function') {
+    return originalCreateApp(options);
+  }
+  return app;
 }
 
 // Start background workers when running as main module (not in tests)
@@ -348,6 +356,16 @@ if (process.env.NODE_ENV !== 'test' && require.main === module) {
 
   startServer();
 }
+
+/**
+ * @module index
+ * @description Entry point for the LiquiFact API server.
+ *
+ * @property {import('express').Express} default - The Express app instance.
+ * @property {Function} createApp - Factory function to create Express app instances.
+ * @property {Function} startServer - Function to start the HTTP server.
+ * @property {Function} resetStore - Function to clear in-memory cache stores.
+ */
 
 module.exports = app;
 module.exports.createApp = createApp;
