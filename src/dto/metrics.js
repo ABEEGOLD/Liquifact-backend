@@ -31,7 +31,8 @@
 
 /**
  * Aggregated invoice counts returned by the SME metrics endpoint.
- * Every field is a non-negative integer.
+ * Every field is a finite, non-negative number. Fractional values are
+ * preserved for backward compatibility; service-generated counts are integers.
  *
  * @typedef {Object} SmeMetricsResponse
  * @property {number} open      - Count of open invoices (pending_verification + verified).
@@ -214,6 +215,44 @@ class MetricsDtoValidationError extends Error {
 }
 
 /**
+ * Coerces numeric input without allowing exceptional values to escape.
+ *
+ * @param {unknown} value - Candidate numeric value.
+ * @returns {number|null} Finite number, or null when coercion is invalid.
+ */
+function toFiniteNumber(value) {
+  try {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Normalises a non-negative metric value while preserving legacy fractions.
+ *
+ * @param {unknown} value - Candidate count value.
+ * @returns {number}
+ */
+function toNonNegativeMetric(value) {
+  const number = toFiniteNumber(value);
+  return number !== null && number >= 0 ? number : 0;
+}
+
+/**
+ * Copies the page array and its plain row objects to isolate response DTOs.
+ *
+ * @param {Object[]} rows - Invoice rows from the service.
+ * @returns {Object[]}
+ */
+function snapshotInvoiceRows(rows) {
+  return rows.map((row) => (
+    row && typeof row === 'object' && !Array.isArray(row) ? { ...row } : row
+  ));
+}
+
+/**
  * Maps a raw invoice-counts object to a typed {@link SmeMetricsResponse} DTO.
  *
  * Every field is coerced to a finite number; fractional values are preserved
@@ -229,17 +268,12 @@ class MetricsDtoValidationError extends Error {
  * @returns {SmeMetricsResponse} Normalised DTO with all four keys guaranteed.
  */
 function toSmeMetricsResponse(raw) {
-  /** @type {*} */
-  const obj = isObjectRecord(raw) ? raw : {};
-  /**
-   * Reads and safely normalizes one known count field.
-   *
-   * @param {'open'|'funded'|'settled'|'defaulted'} field - Count field name.
-   * @returns {number} Finite normalized value or zero.
-   */
-  const readCount = (field) => {
-    const value = readPropertySafely(obj, field);
-    return value === INVALID_PROPERTY ? 0 : toFiniteNumber(value, 0) || 0;
+  const obj = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {};
+  return {
+    open: toNonNegativeMetric(obj.open),
+    funded: toNonNegativeMetric(obj.funded),
+    settled: toNonNegativeMetric(obj.settled),
+    defaulted: toNonNegativeMetric(obj.defaulted),
   };
   return {
     open: readCount('open'),
@@ -307,9 +341,10 @@ function toSmeMetricsMeta(raw) {
   };
 
   // Optional pagination fields — only include when the source had them.
-  const invoices = readPropertySafely(obj, 'invoices');
-  if (invoices !== INVALID_PROPERTY && isArraySafely(invoices)) {
-    meta.invoices = invoices;
+  if (Array.isArray(obj.invoices)) {
+    // Snapshot page membership/order so later mutations cannot change another
+    // response built from the same service result.
+    meta.invoices = snapshotInvoiceRows(obj.invoices);
   }
   const total = readPropertySafely(obj, 'total');
   if (typeof total === 'number' && Number.isFinite(total)) {
@@ -405,35 +440,18 @@ function toSmeMetricsApiResponse(data, meta, error = null) {
  * @returns {PersistenceRecordParams} Normalised DTO.
  */
 function toPersistenceRecordParams(raw) {
-  /** @type {*} */
-  const obj = isObjectRecord(raw) ? raw : {};
-  const endpointValue = readPropertySafely(obj, 'endpoint');
-  const statusValue = readPropertySafely(obj, 'statusCode');
-  const durationValue = readPropertySafely(obj, 'durationSeconds');
-  const causeValue = readPropertySafely(obj, 'cause');
-  const reqValue = readPropertySafely(obj, 'req');
-  const parsedStatus = statusValue === INVALID_PROPERTY ? 200 : toFiniteNumber(statusValue, 200);
-  const parsedDuration = durationValue === INVALID_PROPERTY ? 0 : toFiniteNumber(durationValue, 0);
-
-  const endpoint = String(obj.endpoint || 'unknown');
-  const statusCode = Number(obj.statusCode);
-  const durationSeconds = Number(obj.durationSeconds);
-  const cause = String(obj.cause || 'none');
+  const obj = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {};
+  const statusCode = toFiniteNumber(obj.statusCode);
+  const durationSeconds = toFiniteNumber(obj.durationSeconds);
 
   return {
-    endpoint: /** @type {PersistenceEndpoint} */ (endpointValue === INVALID_PROPERTY || !endpointValue
-      ? 'unknown'
-      : toStringSafely(endpointValue, 'unknown')),
-    statusCode: Number.isInteger(parsedStatus) && parsedStatus >= 100 && parsedStatus <= 599
-      ? parsedStatus
+    endpoint: String(obj.endpoint || 'unknown'),
+    statusCode: Number.isInteger(statusCode) && statusCode >= 100 && statusCode <= 599
+      ? statusCode
       : 200,
-    durationSeconds: Number.isFinite(parsedDuration) && parsedDuration >= 0
-      ? parsedDuration
-      : 0,
-    cause: /** @type {PersistenceCause} */ (
-      causeValue === INVALID_PROPERTY || !causeValue ? 'none' : toStringSafely(causeValue, 'none')
-    ),
-    req: reqValue === INVALID_PROPERTY ? undefined : (reqValue || undefined),
+    durationSeconds: durationSeconds !== null && durationSeconds >= 0 ? durationSeconds : 0,
+    cause: /** @type {PersistenceCause} */ (String(obj.cause || 'none')),
+    req: obj.req || undefined,
   };
 }
 
@@ -451,10 +469,11 @@ function isValidSmeMetricsResponse(value) {
   if (!isObjectRecord(value)) {
     return false;
   }
-  return SME_METRIC_FIELDS.every((field) => {
-    const count = readPropertySafely(value, field);
-    return hasOwnPropertySafely(value, field) && count !== INVALID_PROPERTY && Number.isSafeInteger(count) && count >= 0;
-  });
+  return (
+    [value.open, value.funded, value.settled, value.defaulted].every(
+      (count) => typeof count === 'number' && Number.isFinite(count) && count >= 0,
+    )
+  );
 }
 
 /**
@@ -467,14 +486,12 @@ function isValidPersistenceRecordParams(value) {
   if (!isObjectRecord(value)) {
     return false;
   }
-  const endpoint = readPropertySafely(value, 'endpoint');
-  const statusCode = readPropertySafely(value, 'statusCode');
-  const durationSeconds = readPropertySafely(value, 'durationSeconds');
-  const cause = readPropertySafely(value, 'cause');
-  return endpoint !== INVALID_PROPERTY && typeof endpoint === 'string' &&
-    statusCode !== INVALID_PROPERTY && Number.isInteger(statusCode) && statusCode >= 100 && statusCode <= 599 &&
-    durationSeconds !== INVALID_PROPERTY && Number.isFinite(durationSeconds) && durationSeconds >= 0 &&
-    cause !== INVALID_PROPERTY && typeof cause === 'string';
+  return (
+    typeof value.endpoint === 'string' &&
+    Number.isInteger(value.statusCode) && value.statusCode >= 100 && value.statusCode <= 599 &&
+    typeof value.durationSeconds === 'number' && Number.isFinite(value.durationSeconds) && value.durationSeconds >= 0 &&
+    typeof value.cause === 'string'
+  );
 }
 
 module.exports = {
