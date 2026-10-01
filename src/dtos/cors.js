@@ -66,10 +66,55 @@ const CORS_ORIGIN_NOT_ALLOWED_CODE = 'CORS_ORIGIN_NOT_ALLOWED';
 const CORS_NULL_ORIGIN_CODE = 'CORS_NULL_ORIGIN';
 
 /** @type {string} */
-const CORS_EMPTY_ALLOWLIST_CODE = 'CORS_EMPTY_ALLOWLIST';
+const CORS_CONFIG_DTO_INVALID_CODE = 'CORS_CONFIG_DTO_INVALID';
 
-/** @type {string} */
-const CORS_INVALID_ORIGIN_CODE = 'CORS_INVALID_ORIGIN';
+/**
+ * Requires a non-array object at public DTO conversion boundaries.
+ *
+ * @param {unknown} value - Value supplied to a DTO conversion function.
+ * @param {string} parameterName - Fixed parameter label for the error.
+ * @returns {Object}
+ */
+function requireDtoObject(value, parameterName) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    const error = new TypeError(`${parameterName} must be an object.`);
+    error.code = CORS_CONFIG_DTO_INVALID_CODE;
+    throw error;
+  }
+  return value;
+}
+
+/**
+ * Returns only string entries, failing closed when the field is malformed.
+ *
+ * @param {unknown} value - Candidate allowed-origins field.
+ * @returns {string[]}
+ */
+function normalizeAllowedOrigins(value) {
+  return Array.isArray(value) ? value.filter((origin) => typeof origin === 'string') : [];
+}
+
+/**
+ * Applies the canonical CORS max-age ceiling to DTO data.
+ *
+ * @param {unknown} value - Candidate max-age value.
+ * @returns {number}
+ */
+function normalizeMaxAge(value) {
+  return Number.isInteger(value) && value > 0
+    ? corsConfig.parseMaxAge(String(value))
+    : corsConfig.parseMaxAge(undefined);
+}
+
+/**
+ * Retains valid HTTP status overrides and defaults malformed values to 204.
+ *
+ * @param {unknown} value - Candidate OPTIONS success status.
+ * @returns {number}
+ */
+function normalizeOptionsSuccessStatus(value) {
+  return Number.isInteger(value) && value >= 200 && value < 600 ? value : 204;
+}
 
 // ── DTO constructors / factories ─────────────────────────────────────────────
 
@@ -88,6 +133,7 @@ const CORS_INVALID_ORIGIN_CODE = 'CORS_INVALID_ORIGIN';
  * console.log(dto.maxAge);         // 600
  */
 function corsConfigDtoFromEnv(env = process.env) {
+  requireDtoObject(env, 'env');
   const allowedOrigins = corsConfig.getAllowedOriginsFromEnv(env);
   const isDevelopmentFallback =
     allowedOrigins.length > 0 &&
@@ -199,9 +245,10 @@ function validateOriginDto(origin, allowedOrigins) {
  * app.use(cors(corsOptions));
  */
 function corsConfigDtoToOptions(dto) {
+  requireDtoObject(dto, 'dto');
   // Capture the policy once so later DTO mutations cannot change in-flight
   // middleware decisions.
-  const allowedOrigins = [...(dto.allowedOrigins || [])];
+  const allowedOrigins = normalizeAllowedOrigins(dto.allowedOrigins);
 
   return {
     /**
@@ -223,8 +270,8 @@ function corsConfigDtoToOptions(dto) {
       return callback(err);
     },
 
-    maxAge: dto.maxAge != null ? dto.maxAge : 600,
-    optionsSuccessStatus: dto.optionsSuccessStatus != null ? dto.optionsSuccessStatus : 204,
+    maxAge: normalizeMaxAge(dto.maxAge),
+    optionsSuccessStatus: normalizeOptionsSuccessStatus(dto.optionsSuccessStatus),
   };
 }
 
@@ -236,10 +283,11 @@ function corsConfigDtoToOptions(dto) {
  * @returns {Object} JSON-safe representation.
  */
 function corsConfigDtoToJson(dto) {
+  requireDtoObject(dto, 'dto');
   return {
-    allowedOrigins: [...(dto.allowedOrigins || [])],
-    maxAge: dto.maxAge,
-    optionsSuccessStatus: dto.optionsSuccessStatus,
+    allowedOrigins: normalizeAllowedOrigins(dto.allowedOrigins),
+    maxAge: normalizeMaxAge(dto.maxAge),
+    optionsSuccessStatus: normalizeOptionsSuccessStatus(dto.optionsSuccessStatus),
     isDevelopmentFallback: Boolean(dto.isDevelopmentFallback),
   };
 }
@@ -252,12 +300,11 @@ function corsConfigDtoToJson(dto) {
  * @returns {CorsConfigDto}
  */
 function corsConfigDtoFromJson(json) {
+  requireDtoObject(json, 'json');
   return {
-    allowedOrigins: Array.isArray(json.allowedOrigins)
-      ? json.allowedOrigins.filter((o) => typeof o === 'string')
-      : [],
-    maxAge: Number.isInteger(json.maxAge) && json.maxAge > 0 ? json.maxAge : 600,
-    optionsSuccessStatus: json.optionsSuccessStatus != null ? json.optionsSuccessStatus : 204,
+    allowedOrigins: normalizeAllowedOrigins(json.allowedOrigins),
+    maxAge: normalizeMaxAge(json.maxAge),
+    optionsSuccessStatus: normalizeOptionsSuccessStatus(json.optionsSuccessStatus),
     isDevelopmentFallback: Boolean(json.isDevelopmentFallback),
   };
 }
@@ -275,6 +322,5 @@ module.exports = {
   // Error codes
   CORS_ORIGIN_NOT_ALLOWED_CODE,
   CORS_NULL_ORIGIN_CODE,
-  CORS_EMPTY_ALLOWLIST_CODE,
-  CORS_INVALID_ORIGIN_CODE,
+  CORS_CONFIG_DTO_INVALID_CODE,
 };

@@ -6,126 +6,46 @@ settings:
 
 importers:
 
-  .:
-    dependencies:
-      '@aws-sdk/client-s3':
-        specifier: ^3.665.0
-        version: 3.1142.0
-      '@aws-sdk/s3-request-presigner':
-        specifier: ^3.665.0
-        version: 3.1142.0
-      '@sentry/node':
-        specifier: ^8.0.0
-        version: 8.55.2(supports-color@8.1.1)
-      '@stellar/stellar-sdk':
-        specifier: ^16.0.1
-        version: 16.3.0(debug@4.4.3(supports-color@8.1.1))(supports-color@8.1.1)
-      ajv:
-        specifier: ^8.17.1
-        version: 8.20.0
-      ajv-formats:
-        specifier: ^3.0.1
-        version: 3.0.1(ajv@8.20.0)
-      axios:
-        specifier: ^1.16.1
-        version: 1.20.0(debug@4.4.3(supports-color@8.1.1))(supports-color@8.1.1)
-      better-sqlite3:
-        specifier: ^13.0.1
-        version: 13.0.3
-      chessify-protocol:
-        specifier: ^0.1.0
-        version: 0.1.2(@babel/core@7.29.7(supports-color@8.1.1))(@opentelemetry/api@1.9.1)(@tanstack/query-core@5.104.0)(@types/react@19.3.0)(encoding@0.1.13)(lit@3.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)(typescript@5.9.3)(use-sync-external-store@1.4.0(react@19.3.0))(zod@4.6.5)
-      cors:
-        specifier: ^2.8.6
-        version: 2.8.6
-      dotenv:
-        specifier: ^17.3.1
-        version: 17.4.2
-      express:
-        specifier: ^5.2.1
-        version: 5.2.1(supports-color@8.1.1)
-      express-rate-limit:
-        specifier: ^7.5.0
-        version: 7.5.1(express@5.2.1(supports-color@8.1.1))
-      helmet:
-        specifier: ^8.1.0
-        version: 8.3.0
-      jsonwebtoken:
-        specifier: ^9.0.2
-        version: 9.0.3
-      knex:
-        specifier: ^3.1.0
-        version: 3.3.0(better-sqlite3@13.0.3)(sqlite3@5.1.7(supports-color@8.1.1))(supports-color@8.1.1)
-      multer:
-        specifier: ^1.4.5-lts.1
-        version: 1.4.5-lts.2
-      nanoid:
-        specifier: ^5.1.9
-        version: 5.1.16
-      pino:
-        specifier: ^10.3.1
-        version: 10.3.1
-      pino-http:
-        specifier: ^11.0.0
-        version: 11.0.0
-      pino-pretty:
-        specifier: ^13.1.3
-        version: 13.1.3
-      prom-client:
-        specifier: ^14.2.0
-        version: 14.2.0
-      rate-limit-redis:
-        specifier: ^4.3.1
-        version: 4.3.1(express-rate-limit@7.5.1(express@5.2.1(supports-color@8.1.1)))
-      sqlite3:
-        specifier: ^5.1.6
-        version: 5.1.7(supports-color@8.1.1)
-      swagger-jsdoc:
-        specifier: ^6.2.8
-        version: 6.3.0(openapi-types@12.1.3)
-      zod:
-        specifier: ^4.3.6
-        version: 4.6.5
-    devDependencies:
-      '@babel/types':
-        specifier: ^7.29.7
-        version: 7.29.8
-      '@types/node':
-        specifier: ^20.0.0
-        version: 20.19.43
-      autocannon:
-        specifier: ^8.0.0
-        version: 8.0.0
-      c8:
-        specifier: ^10.1.0
-        version: 10.1.3
-      eslint:
-        specifier: ^9.39.5
-        version: 9.39.5(supports-color@8.1.1)
-      eslint-plugin-jsdoc:
-        specifier: 50.6.3
-        version: 50.6.3(eslint@9.39.5(supports-color@8.1.1))(supports-color@8.1.1)
-      eslint-plugin-security:
-        specifier: ^3.0.1
-        version: 3.0.1
-      globals:
-        specifier: ^16.0.0
-        version: 16.5.0
-      jest:
-        specifier: ^30.3.0
-        version: 30.5.2(@types/node@20.19.43)(supports-color@8.1.1)(ts-node@10.9.2(@types/node@20.19.43)(typescript@5.9.3))
-      redis:
-        specifier: ^6.0.1
-        version: 6.2.1(@opentelemetry/api@1.9.1)
-      supertest:
-        specifier: ^7.0.0
-        version: 7.3.0(supports-color@8.1.1)
-      ts-node:
-        specifier: ^10.9.2
-        version: 10.9.2(@types/node@20.19.43)(typescript@5.9.3)
-      typescript:
-        specifier: ^5.9.3
-        version: 5.9.3
+devDependencies:
+  '@babel/types':
+    specifier: ^7.29.7
+    version: 7.29.7
+  '@types/node':
+    specifier: ^20.0.0
+    version: 20.19.43
+  autocannon:
+    specifier: ^8.0.0
+    version: 8.0.0
+  c8:
+    specifier: ^10.1.0
+    version: 10.1.3
+  eslint:
+    specifier: ^9.21.0
+    version: 9.39.5
+  eslint-plugin-jsdoc:
+    specifier: 50.6.3
+    version: 50.6.3(eslint@9.39.5)
+  eslint-plugin-security:
+    specifier: ^3.0.1
+    version: 3.0.1
+  globals:
+    specifier: ^16.0.0
+    version: 16.5.0
+  jest:
+    specifier: ^30.3.0
+    version: 30.4.2(@types/node@20.19.43)(ts-node@10.9.2)
+  redis:
+    specifier: 6.1.0
+    version: 6.1.0(@opentelemetry/api@1.9.1)
+  supertest:
+    specifier: ^7.0.0
+    version: 7.2.2
+  ts-node:
+    specifier: ^10.9.2
+    version: 10.9.2(@types/node@20.19.43)(typescript@5.9.3)
+  typescript:
+    specifier: ^5.0.0
+    version: 5.9.3
 
 packages:
 
