@@ -467,6 +467,40 @@ describe('CORS DTO layer', () => {
   // ─── Integration: DTO-built options behave like real cors middleware ───────
 
   describe('DTO → cors middleware integration', () => {
+    it('keeps concurrent and repeated requests on the creation-time policy snapshot', async () => {
+      const { corsConfigDtoToOptions } = require('../../src/dtos/cors');
+      const allowedOrigins = ['https://app.example.com'];
+      const corsOpts = corsConfigDtoToOptions({
+        allowedOrigins,
+        maxAge: 600,
+        optionsSuccessStatus: 204,
+        isDevelopmentFallback: false,
+      });
+      allowedOrigins.push('https://evil.com');
+
+      const app = express();
+      app.use(cors(corsOpts));
+      app.use((err, req, res, next) => {
+        if (err && err.isCorsOriginRejected) {
+          return res.status(403).json({ error: err.message });
+        }
+        next(err);
+      });
+      app.get('/test', (req, res) => res.json({ ok: true }));
+
+      const responses = await Promise.all([
+        request(app).get('/test').set('Origin', 'https://app.example.com'),
+        request(app).get('/test').set('Origin', 'https://evil.com'),
+        request(app).get('/test').set('Origin', 'https://evil.com'),
+        request(app).get('/test'),
+      ]);
+
+      expect(responses.map((response) => response.status)).toEqual([200, 403, 403, 200]);
+      expect(responses[0].headers['access-control-allow-origin']).toBe('https://app.example.com');
+      expect(responses[1].headers['access-control-allow-origin']).toBeUndefined();
+      expect(responses[2].headers['access-control-allow-origin']).toBeUndefined();
+    });
+
     it('allows an origin when using DTO-built options with the cors package', async () => {
       const { corsConfigDtoToOptions } = require('../../src/dtos/cors');
       const dto = {
@@ -612,6 +646,7 @@ describe('CORS DTO layer', () => {
         expect(dtos).toHaveProperty('corsConfigDtoFromJson');
         expect(dtos).toHaveProperty('CORS_ORIGIN_NOT_ALLOWED_CODE');
         expect(dtos).toHaveProperty('CORS_NULL_ORIGIN_CODE');
+        expect(dtos).toHaveProperty('CORS_CONFIG_DTO_INVALID_CODE');
 
         expect(typeof dtos.corsConfigDtoFromEnv).toBe('function');
         expect(typeof dtos.validateOriginDto).toBe('function');
