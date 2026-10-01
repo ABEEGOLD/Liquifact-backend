@@ -47,6 +47,13 @@
  * if (err.code === VALIDATION_CODES.INVALID_TRANSITION) { ... }
  * ```
  *
+ * ## Determinism guarantees
+ * The classification in {@link codeForIssue} is a pure function of the issue
+ * object: it never consults mutable module state, the clock, or the network,
+ * and it never throws. The same input always yields the same code, which is
+ * what makes failure recovery replayable and observable.
+ *
+ * @defines {string} MetricsValidationCode
  * @module constants/metricsValidationCodes
  */
 
@@ -66,6 +73,7 @@
 /**
  * Validation codes owned by the invoice state-machine layer.
  *
+ * @param {string} MetricsValidationCode
  * @readonly
  * @enum {string}
  * @property {string} INVALID_TRANSITION        - fromState→toState pair not in VALID_TRANSITIONS.
@@ -316,6 +324,47 @@ const VALIDATION_CODES = Object.freeze({
 // ---------------------------------------------------------------------------
 // Exports
 // ---------------------------------------------------------------------------
+
+/**
+ * Classifies a whole `ZodError` into a deterministic, deduplicated list of
+ * codes.
+ *
+ * This is the recovery primitive for the caller: given a failed validation,
+ * it produces a stable set of codes that can be logged, metered, and returned
+ * to the client without exposing the original messages (which may echo
+ * untrusted input).
+ *
+ * Guarantees:
+  - Never throws, even for `null`/`undefined`/malformed input.
+  - Order is deterministic: first-seen order, duplicates removed.
+  - Always returns at least one code so callers never have to handle an
+    empty classification.
+ *
+ * @param {unknown} error - A `ZodError` or anything else.
+ * @returns {string[]} Deduplicated members of {@link METRICS_VALIDATION_CODES}.
+ */
+function codesForError(error) {
+  const issues =
+    error && typeof error === 'object' && Array.isArray(error.issues)
+      ? error.issues
+      : [];
+
+  const seen = new Set();
+  const out = [];
+  for (const issue of issues) {
+    const code = codeForIssue(issue);
+    if (!seen.has(code)) {
+      seen.add(code);
+      out.push(code);
+    }
+  }
+
+  if (out.length === 0) {
+    out.push(METRICS_VALIDATION_CODES.FIELD_INVALID);
+  }
+
+  return out;
+}
 
 module.exports = {
   INVOICE_SM_CODES,
