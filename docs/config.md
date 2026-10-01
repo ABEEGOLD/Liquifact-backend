@@ -278,8 +278,9 @@ Provides Stellar/Soroban network configuration and enforces strict network–RPC
 |---|---|
 | `STELLAR_NETWORK` missing | `STELLAR_NETWORK is required` |
 | `SOROBAN_RPC_URL` missing | `SOROBAN_RPC_URL is required` |
-| `STELLAR_NETWORK` not in `VALID_NETWORKS` | `Invalid STELLAR_NETWORK: <value>` |
-| RPC URL does not match the expected URL for the network | `Mismatch: STELLAR_NETWORK=<N> requires SOROBAN_RPC_URL="<expected>", but got "<actual>". This combination would cause on-chain validation failures.` |
+| `STELLAR_NETWORK` not in `VALID_NETWORKS` | `Invalid STELLAR_NETWORK: expected one of TESTNET, MAINNET, FUTURENET` |
+| RPC URL does not match the expected URL for the network | `STELLAR_NETWORK=<N> requires SOROBAN_RPC_URL="<expected>" (Mismatch).` The configured URL is not included in the error. |
+| Explicit passphrase does not match the network | `STELLAR_NETWORK_PASSPHRASE does not match STELLAR_NETWORK` |
 | `getNetworkPassphrase` / `getExpectedRpc` called with unknown network | `Unknown network: <value>` |
 | `getStellarConfig()` called before `validate()` | `Config not validated. Call validate() first.` |
 
@@ -288,7 +289,8 @@ Provides Stellar/Soroban network configuration and enforces strict network–RPC
 ```js
 // src/index.js (bootstrap)
 const { validateStellarConfig } = require('./config/stellar');
-validateStellarConfig(); // hard fail if misconfigured
+const stellarConfig = validateStellarConfig(); // hard fail if misconfigured
+process.env.STELLAR_NETWORK_PASSPHRASE = stellarConfig.passphrase;
 
 // In a Soroban service
 const { getStellarConfig } = require('./config/stellar');

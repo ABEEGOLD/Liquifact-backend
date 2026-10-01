@@ -15,12 +15,7 @@ require('dotenv').config();
 
 const app = require('./app');
 const { validate, logRedactedSummary } = require('./config');
-const {
-  PortValidationError,
-  resolvePortFromEnv,
-  validatePortArgument,
-} = require('./config/listenPort');
-const logger = require('./logger');
+const { validateStellarConfig } = require('./config/stellar');
 const shutdownCoordinator = require('./utils/shutdownCoordinator');
 const logger = require('./logger');
 
@@ -84,7 +79,9 @@ function runBootConfigValidation() {
   }
   try {
     validate();
-
+    const stellarConfig = validateStellarConfig();
+    process.env.STELLAR_NETWORK_PASSPHRASE = stellarConfig.passphrase;
+    
     // Boot-time dependency validation phase
     const { validateDependencies } = require('./config/dependencyValidator');
     validateDependencies();
