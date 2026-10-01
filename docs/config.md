@@ -307,20 +307,25 @@ SOROBAN_RPC_URL=https://soroban-testnet.stellar.org
 
 **Source:** [`src/config/cache.js`](../src/config/cache.js)
 
-Parses the in-memory escrow cache TTL from environment variables and exposes a typed config object. Used by the escrow read service to decide how long to hold a cached escrow state before re-querying.
+Validates in-memory cache TTLs and capacities for escrow, invoice-state and indexer responses. Exposes an immutable startup snapshot and supports independent snapshots from an environment map.
 
 ### Exports
 
-| Export | Type | Description |
-|---|---|---|
-| `cacheConfig` | `{ escrowTtl: number }` | Module-level singleton parsed at load time. `escrowTtl` is in **milliseconds**. |
-| `parseCacheConfig(env?)` | `(env?) => { escrowTtl: number }` | Parses the TTL from a given env map. Safe to call multiple times (used in tests). |
+| Export                             | Type                            | Description                                                                                                                                                                           |
+| ---------------------------------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cacheConfig`                      | Frozen cache settings object    | Module-level snapshot parsed at load time. All TTLs are in **milliseconds**.                                                                                                          |
+| `parseCacheConfig(env?, options?)` | Returns a fresh frozen snapshot | Parses a supplied environment map without modifying it or shared state. Optional `options.onInvalid(field, fallback)` receives only an allowlisted setting name and its safe default. |
 
 ### Environment variables
 
-| Variable | Default | Constraint | Description |
-|---|---|---|---|
-| `ESCROW_CACHE_TTL_SECONDS` | `30` | positive integer | In-memory escrow cache TTL in seconds. Converted to milliseconds on load. |
+| Variable                          | Default | Constraint            | Description                                                                            |
+| --------------------------------- | ------- | --------------------- | -------------------------------------------------------------------------------------- |
+| `ESCROW_CACHE_TTL_SECONDS`        | `30`    | integer 1–2147483     | In-memory escrow cache TTL in seconds. Converted to milliseconds on load.              |
+| `ESCROW_CACHE_MAX_ENTRIES`        | `500`   | positive safe integer | Maximum retained escrow read responses.                            |
+| `INVOICE_STATE_CACHE_TTL_SECONDS` | `30`    | integer 1–2147483     | Invoice-state response TTL in seconds.                                                 |
+| `INVOICE_STATE_CACHE_MAX_ENTRIES` | `500`   | positive safe integer | Invoice-state capacity setting; the response store has its own capacity configuration. |
+| `INDEXER_CACHE_TTL_SECONDS`       | `10`    | integer 1–2147483     | Indexer response TTL in seconds.                                                       |
+| `INDEXER_CACHE_MAX_ENTRIES`       | `200`   | positive safe integer | Maximum retained indexer responses.                                                    |
 
 > **Note:** The Redis-backed escrow cache has separate variables: `REDIS_ESCROW_CACHE_ENABLED`, `REDIS_ESCROW_CACHE_TTL_SECONDS` (clamped to `5–300`), and `REDIS_ESCROW_LEDGER_GAP_THRESHOLD`. Those are consumed directly by the Redis cache layer, not by this module.
 
@@ -328,14 +333,37 @@ Parses the in-memory escrow cache TTL from environment variables and exposes a t
 
 ```js
 {
-  escrowTtl: 30000  // number — TTL in milliseconds (ESCROW_CACHE_TTL_SECONDS × 1000)
+  escrowTtl: 30000,
+  escrowMaxEntries: 500,
+  invoiceStateTtl: 30000,
+  invoiceStateMaxEntries: 500,
+  indexerTtl: 10000,
+  indexerMaxEntries: 200
 }
 ```
 
 ### Fallback behaviour
 
 - If `ESCROW_CACHE_TTL_SECONDS` is absent → `escrowTtl = 30000` (30 s)
-- If the value is not a finite positive integer (e.g. `"abc"`, `"-5"`, `"0"`) → `escrowTtl = 30000`
+- Every setting must be a complete decimal integer string (surrounding whitespace and
+  leading zeroes are accepted), or a positive safe integer number in programmatic env maps.
+  Fractions, exponent/hex notation, trailing text, non-finite values, zero, negatives and
+  unsafe integers use that setting's default. TTLs above 2147483 seconds also use defaults,
+  keeping converted milliseconds below the signed 32-bit timer limit.
+- Only own data properties are read. Inherited settings are ignored and accessor getters
+  or object coercion methods are never invoked. Invalid environment map types throw a
+  `TypeError` instead of publishing partially configured state.
+- Snapshots, including `cacheConfig`, are frozen. Read-only callers keep the same interfaces.
+  To change settings in tests or dynamic configuration, create a new snapshot with
+  `parseCacheConfig(env)` instead of assigning to an existing one. The module-level snapshot
+  does not change when `process.env` changes later.
+- At startup, invalid present values emit a `CACHE_CONFIG_INVALID_VALUE` warning containing
+  only the setting name and default. Raw values and unrelated environment variables are
+  never included. Missing settings use defaults silently. Later parse calls are silent unless
+  `onInvalid` is supplied, avoiding warnings on every cache lookup. A throwing diagnostic
+  sink aborts that parse without altering previously published snapshots; callers can retry.
+- Cache configuration does not grant access to cached data. Existing tenant/environment,
+  allowlist, active-mapping and route authorization checks remain in their callers.
 
 ### Example
 
