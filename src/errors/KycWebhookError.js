@@ -3,10 +3,23 @@
 /**
  * @fileoverview Structured error for KYC webhook handlers.
  *
- * Carries an HTTP status and a machine-readable error code through the
- * Express error chain so that {@link module:middleware/kycWebhookErrorHandler}
- * can produce a consistent structured response without per-handler
- * duplication.
+ * Carries an HTTP status, a machine-readable error code, and optional
+ * observability context (smeId, tenantId, requestId) through the Express
+ * error chain so that {@link module:middleware/kycWebhookErrorHandler}
+ * can produce a consistent structured response and structured log line
+ * without per-handler duplication.
+ *
+ * ## Backward compatibility
+ *
+ * The three-argument form `new KycWebhookError(message, status, code)` is
+ * preserved exactly.  The optional fourth argument `context` is additive:
+ * all existing call sites work without modification.
+ *
+ * ## Retryability contract
+ *
+ * `isRetryable()` is the single authoritative source of truth for whether
+ * a client should retry.  `kycWebhookErrorHandler` delegates to this method
+ * rather than duplicating the RETRYABLE_CODES / RETRYABLE_STATUSES sets.
  *
  * ### Validation boundaries (issue #1372)
  *
