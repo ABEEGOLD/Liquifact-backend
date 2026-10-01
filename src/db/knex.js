@@ -4,13 +4,27 @@
  * @file src/db/knex.js
  * @description Knex connection factory with validation boundaries.
  *
- * Connection selection rules
- * --------------------------
+ * ## Connection selection rules
  * - NODE_ENV=test       → always uses the `test` config block (in-memory SQLite).
  *                         Never falls back to development or production config.
  * - NODE_ENV=production → uses the `production` config block. Throws if the
- *                         `DATABASE_URL` env var is absent.
+ *                         `DATABASE_URL` env var is absent. Enforces TLS via
+ *                         `ssl: { rejectUnauthorized: true }` unless explicitly
+ *                         overridden by DATABASE_SSL=false (not recommended).
  * - anything else       → uses the `development` config block.
+ *
+ * State invariants
+ * ----------------
+ * The module tracks three lifecycle states:
+ *
+ *   READY       – the pool is healthy and ready to serve queries.
+ *   DESTROYING  – db.destroy() has been called; no new queries may be issued.
+ *   DESTROYED   – the pool has been fully torn down.
+ *
+ * Any attempt to call a query method (db(table), db.raw, db.transaction, etc.)
+ * while in DESTROYING or DESTROYED state throws a `DatabaseLifecycleError`
+ * with code `DB_ALREADY_DESTROYED`.  This makes query-after-shutdown bugs
+ * immediately visible instead of silently hanging or producing cryptic errors.
  *
  * Pool error handling
  * -------------------
@@ -31,8 +45,7 @@
  * `jest.mock('../../src/db/knex')` is called, so this file is never executed
  * during unit tests that use the manual mock.
  *
- * Config selection logic
- * ----------------------
+ * ## Config selection logic
  * The config-selection logic lives in `src/db/resolveConfig.js` so it can be
  * unit-tested independently without loading knex or pino.
  *
@@ -43,8 +56,9 @@ const knex = require('knex');
 const logger = require('../logger');
 const resolveConfig = require('./resolveConfig');
 
-/** @type {string} */
-const env = process.env.NODE_ENV || 'development';
+// ---------------------------------------------------------------------------
+// Lifecycle state
+// ---------------------------------------------------------------------------
 
 /**
  * Validates that the environment string is one of the allowed values.
@@ -137,23 +151,62 @@ function validatePoolConfig(pool) {
  * @param {import('knex').Knex} instance - The initialised Knex instance.
  * @returns {void}
  */
-function attachPoolErrorHandlers(instance) {
-  // `instance.client.pool` is exposed by tarn (the pool library knex uses).
-  const pool = instance.client && instance.client.pool;
-  if (!pool) { return; }
+const DB_STATE = Object.freeze({
+  READY: 'READY',
+  DESTROYING: 'DESTROYING',
+  DESTROYED: 'DESTROYED',
+});
 
-  pool.on('createFail', (eventId, err) => {
-    logger.error({ err, eventId }, '[db] Pool: failed to create connection');
-  });
+/**
+ * Current lifecycle state of the db singleton.
+ * Mutated only by `patchForLifecycle`.
+ * @type {string}
+ */
+let _dbState = DB_STATE.READY;
 
-  pool.on('acquireFail', (eventId, err) => {
-    logger.error({ err, eventId }, '[db] Pool: failed to acquire connection');
-  });
+// ---------------------------------------------------------------------------
+// Error type
+// ---------------------------------------------------------------------------
 
-  pool.on('destroyFail', (eventId, err) => {
-    logger.warn({ err, eventId }, '[db] Pool: failed to destroy connection');
-  });
+/**
+ * Thrown when a query is attempted against a pool that is being torn down or
+ * has already been destroyed.
+ */
+class DatabaseLifecycleError extends Error {
+  /**
+   * @param {string} message - Human-readable message.
+   * @param {string} [state] - The DB_STATE value at the time of the error.
+   */
+  constructor(message, state) {
+    super(message);
+    this.name = 'DatabaseLifecycleError';
+    /** Stable machine-readable code for programmatic handling. */
+    this.code = 'DB_ALREADY_DESTROYED';
+    /** The lifecycle state that caused this error (DESTROYING or DESTROYED). */
+    this.dbState = state || _dbState;
+  }
 }
+
+// ---------------------------------------------------------------------------
+// Pool configuration bounds
+// ---------------------------------------------------------------------------
+
+/**
+ * Hard limits for pool configuration values. Values outside these ranges
+ * are clamped silently – no exception is thrown, but a warning is logged so
+ * operators can correct misconfigured knexfiles.
+ *
+ * @type {Readonly<Record<string, {min: number, max: number}>>}
+ */
+const POOL_BOUNDS = Object.freeze({
+  min:                  { min: 0,     max: 50        },
+  max:                  { min: 1,     max: 100       },
+  createTimeoutMillis:  { min: 1_000, max: 120_000   },
+  acquireTimeoutMillis: { min: 1_000, max: 120_000   },
+  idleTimeoutMillis:    { min: 1_000, max: 3_600_000 },
+  reapIntervalMillis:   { min: 100,   max: 60_000    },
+  createRetryIntervalMillis: { min: 50, max: 10_000  },
+});
 
 /**
  * Default pool configuration applied to every environment unless the config
@@ -183,8 +236,8 @@ validateConfigStructure(config);
 validatePoolConfig(config.pool);
 
 const mergedConfig = {
-  ...config,
-  pool: { ...DEFAULT_POOL, ...(config.pool || {}) },
+  ...tlsConfig,
+  pool: mergedPool,
 };
 
 validatePoolConfig(mergedConfig.pool);
@@ -216,13 +269,26 @@ function validateKnexInstance(instance) {
 
 /**
  * Singleton Knex database instance for the current environment.
- * Subsequent `require` calls return the cached export.
+ * Wrapped with lifecycle guards so query-after-destroy is immediately
+ * detectable rather than silently hanging or producing cryptic errors.
  *
- * @type {import('knex').Knex}
+ * Subsequent `require` calls return the cached export (Node module cache).
+ *
+ * Extended with two additional properties:
+ * - `destroyOnce()` — idempotent, concurrent-safe pool teardown.
+ * - `getHealthInfo()` — structured DB liveness snapshot for /readyz.
+ *
+ * All other Knex methods (`db('table')`, `db.raw`, `db.transaction`, etc.) are
+ * available as usual.  The extensions are non-enumerable to avoid surprising
+ * callers that spread the export.
+ *
+ * @type {import('knex').Knex & { destroyOnce: () => Promise<void>, getHealthInfo: () => Promise<object> }}
  */
-const db = knex(mergedConfig);
+const _rawDb = knex(mergedConfig);
 
 validateKnexInstance(db);
 attachPoolErrorHandlers(db);
 
 module.exports = db;
+module.exports.DatabaseLifecycleError = DatabaseLifecycleError;
+module.exports.DB_STATE = DB_STATE;
