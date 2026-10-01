@@ -334,24 +334,39 @@ SOROBAN_RPC_URL=https://soroban-testnet.stellar.org
 
 ---
 
-## 4. config/cache.js — Escrow Cache TTL
+## 4. config/cache.js — In-process cache bounds
 
 **Source:** [`src/config/cache.js`](../src/config/cache.js)
 
-Parses the in-memory escrow cache TTL from environment variables and exposes a typed config object. Used by the escrow read service to decide how long to hold a cached escrow state before re-querying.
+Parses the TTL and entry bound for every in-process cache from environment variables and exposes a typed, frozen config object. Consumed by the escrow read cache, the indexer listing cache, the invoice-state response cache, and the escrow address mapping cache.
+
+Every knob here is a **performance** knob: none of them protects a security, financial, or durability invariant. A bad value therefore never stops the service from booting, but it must also never produce an out-of-contract value — an `undefined` or `NaN` TTL/entry bound silently disables *both* expiry and eviction and turns a one-line config mistake into an unbounded-memory leak.
 
 ### Exports
 
 | Export | Type | Description |
 |---|---|---|
-| `cacheConfig` | `{ escrowTtl: number }` | Module-level singleton parsed at load time. `escrowTtl` is in **milliseconds**. |
-| `parseCacheConfig(env?)` | `(env?) => { escrowTtl: number }` | Parses the TTL from a given env map. Safe to call multiple times (used in tests). |
+| `cacheConfig` | `CacheConfig` (frozen) | Load-time snapshot parsed from `process.env`. |
+| `parseCacheConfig(env?, options?)` | `(env?, options?) => CacheConfig` (frozen) | Pure parse. `options.onFallback` is called once per rejected value. |
+| `describeCacheConfigFallbacks(env?)` | `(env?) => ReadonlyArray<CacheConfigFallback>` | Rejections for a given env map, with no logging and no module-state change. |
+| `getCacheConfig()` | `() => CacheConfig` | Configuration currently active (reflects the latest reload). |
+| `getCacheConfigFallbacks()` | `() => ReadonlyArray<CacheConfigFallback>` | Rejections recorded by the most recent activation. |
+| `reloadCacheConfig(env?)` | `(env?) => CacheConfig` | Re-reads the environment and atomically replaces the active configuration. |
+| `CACHE_CONFIG_LIMITS` | frozen object | Accepted `{ min, max }` per knob class, for runbooks and assertions. |
+| `CACHE_CONFIG_FALLBACK_REASON` | frozen object | Bounded reason enum — safe to use as a metrics label. |
+| `DEFAULT_*` | numbers | Per-knob defaults (`DEFAULT_ESCROW_MAX_ENTRIES` is retained for backward compatibility). |
+| `_resetCacheConfigForTests`, `_resetLoggerForTests` | functions | Test-only seams. |
 
 ### Environment variables
 
 | Variable | Default | Constraint | Description |
 |---|---|---|---|
-| `ESCROW_CACHE_TTL_SECONDS` | `30` | positive integer | In-memory escrow cache TTL in seconds. Converted to milliseconds on load. |
+| `ESCROW_CACHE_TTL_SECONDS` | `30` | integer `1..86400` | Escrow read cache TTL, seconds. Converted to milliseconds on load. |
+| `ESCROW_CACHE_MAX_ENTRIES` | `500` | integer `1..100000` | Escrow read cache entry bound. |
+| `INDEXER_CACHE_TTL_SECONDS` | `10` | integer `1..86400` | Indexer listing cache TTL, seconds. |
+| `INDEXER_CACHE_MAX_ENTRIES` | `200` | integer `1..100000` | Indexer listing cache entry bound. |
+| `INVOICE_STATE_CACHE_TTL_SECONDS` | `30` | integer `1..86400` | Invoice-state response cache TTL, seconds. |
+| `INVOICE_STATE_CACHE_MAX_ENTRIES` | `500` | integer `1..100000` | Invoice-state response cache entry bound. |
 
 > **Note:** The Redis-backed escrow cache has separate variables: `REDIS_ESCROW_CACHE_ENABLED`, `REDIS_ESCROW_CACHE_TTL_SECONDS` (clamped to `5–300`), and `REDIS_ESCROW_LEDGER_GAP_THRESHOLD`. Those are consumed directly by the Redis cache layer, not by this module.
 
@@ -359,14 +374,42 @@ Parses the in-memory escrow cache TTL from environment variables and exposes a t
 
 ```js
 {
-  escrowTtl: 30000  // number — TTL in milliseconds (ESCROW_CACHE_TTL_SECONDS × 1000)
+  escrowTtl: 30000,              // ms   — ESCROW_CACHE_TTL_SECONDS × 1000
+  escrowMaxEntries: 500,         // entries
+  indexerTtl: 10000,             // ms   — INDEXER_CACHE_TTL_SECONDS × 1000
+  indexerMaxEntries: 200,        // entries
+  invoiceStateTtl: 30000,        // ms   — INVOICE_STATE_CACHE_TTL_SECONDS × 1000
+  invoiceStateMaxEntries: 500,   // entries
 }
 ```
 
+The object is frozen before it is returned or published.
+
 ### Fallback behaviour
 
-- If `ESCROW_CACHE_TTL_SECONDS` is absent → `escrowTtl = 30000` (30 s)
-- If the value is not a finite positive integer (e.g. `"abc"`, `"-5"`, `"0"`) → `escrowTtl = 30000`
+One rule, applied to every knob: **the value is honoured only when it is a base-10 integer literal (optionally signed, surrounding whitespace ignored) inside `[min, max]`; every other case uses the documented default.** There is no clamping arithmetic and no second code path, so the outcome is fully determined by the input.
+
+| Input | Result | `reason` |
+|---|---|---|
+| absent, empty, or whitespace-only | default | *(none — a normal default, not a rejection)* |
+| not a string or number | default | `not_a_string` |
+| `"abc"`, `"1.5"`, `"1e3"`, `"60s"`, `"0x10"`, safe-integer overflow | default | `not_an_integer` |
+| numeric `NaN` or `±Infinity` | default | `not_finite` |
+| `"0"`, `"-1"` | default | `not_positive` |
+| in-range shape but above `max` | default | `out_of_range` |
+| `env` is not an object, or reading it throws | default for every knob | `unreadable_env` |
+
+### Observability
+
+A rejected value is logged once per distinct `variable:reason` pair as a single `warn` event named `cache_config.fallback`, carrying `variable`, `key`, `reason`, `envDefault`, `minAccepted`, `maxAccepted`, and `appliedValue`. The raw operator-supplied value is deliberately **not** logged. The same records are available programmatically via `getCacheConfigFallbacks()` and `describeCacheConfigFallbacks()`.
+
+`parseCacheConfig` never throws, and neither does module load: an unusable `env` source, a throwing property getter, a throwing `onFallback` observer, or a logger that fails to initialise all degrade to the documented default.
+
+### Guarantees
+
+- **Deterministic** — a pure function of `env`: no clock, no randomness, no I/O, no module state, fixed iteration order. Repeat calls are idempotent.
+- **Atomic** — the active configuration is only ever *replaced* with a complete frozen object, never mutated in place, so a concurrent or retried reload can never be observed half-applied.
+- **Never fatal** — cache configuration cannot prevent the process from starting.
 
 ### Example
 
