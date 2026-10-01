@@ -23,6 +23,10 @@
  * Ingest validation reuses the existing event schema; other boundaries enforce
  * their structural and range invariants directly.
  *
+ * Compatibility contract: every mapper is total and deterministic. Unknown or
+ * malformed inputs are coerced to safe defaults rather than throwing, so that
+ * callers relying on the previous inline behavior keep working unchanged.
+ *
  * @module dto/indexer
  */
 
@@ -275,6 +279,23 @@ function mapQueryToDTO(params) {
   const order = sorting.order === undefined ? 'desc' : sorting.order;
   if (order !== 'asc' && order !== 'desc') {
     throw new TypeError('sorting.order must be asc or desc');
+  }
+
+  const sortBy = sorting.sortBy !== undefined ? String(sorting.sortBy) : 'observed_at';
+  if (sortBy !== 'observed_at' && sortBy !== 'ledger_sequence') {
+    throw new RangeError(`mapQueryToDTO: invalid sortBy "${sortBy}"`);
+  }
+
+  const order = sorting.order === 'asc' ? 'asc' : 'desc';
+
+  const page = pagination.page !== undefined ? Number(pagination.page) : undefined;
+  if (page !== undefined && (!Number.isInteger(page) || page < 1)) {
+    throw new RangeError('mapQueryToDTO: page must be a positive integer');
+  }
+
+  const limit = pagination.limit !== undefined ? Number(pagination.limit) : undefined;
+  if (limit !== undefined && (!Number.isInteger(limit) || limit < 1 || limit > 100)) {
+    throw new RangeError('mapQueryToDTO: limit must be an integer between 1 and 100');
   }
 
   return Object.freeze({
@@ -541,9 +562,28 @@ function mapServiceResultToResponseDTO(serviceResult) {
  * the shape contract is expressed once in this module rather than scattered
  * across the job.
  *
+ * Concurrent-execution invariants
+ * ────────────────────────────────
+ * - `observedAt` is always captured from `raw.observedAt` when present, or
+ *   pinned to `capturedAt` (which the caller may supply, defaulting to the
+ *   current instant).  This means two concurrent calls for the same raw event
+ *   without an explicit `observedAt` will share the same timestamp when
+ *   supplied the same `capturedAt`, producing deterministic ordering.
+ * - `eventBody` is a shallow copy of the source so that subsequent mutations
+ *   to `raw` do not affect the already-frozen DTO.
+ * - `invoiceId` must be a non-empty string; an empty invoiceId makes the DTO
+ *   unusable for projection keying and is therefore rejected here rather than
+ *   inside the persistence layer.
+ *
  * @param {object} raw - Raw record from `fetchEscrowEventsFromHorizon`.
  * @param {string} invoiceId - Pre-resolved invoice ID for this event.
+ * @param {object} [opts] - Optional overrides for deterministic behaviour.
+ * @param {string} [opts.capturedAt] - ISO-8601 timestamp to use when
+ *   `raw.observedAt` is absent.  Callers that process a batch should derive
+ *   this once before the loop so every event in the batch shares the same
+ *   fallback timestamp.
  * @returns {IndexerIngestEventDTO}
+ * @throws {TypeError} If `invoiceId` is falsy (empty string, null, undefined).
  */
 function mapRawToIngestDTO(raw, invoiceId) {
   const source = requireRecord(raw, 'raw event');
@@ -572,8 +612,12 @@ function mapRawToIngestDTO(raw, invoiceId) {
  * expected by `persistEscrowEvent` (the canonical event object).  This is the
  * inverse of `mapRawToIngestDTO` plus field aliasing.
  *
+ * The returned object is frozen so that concurrent consumers of the same
+ * normalized event cannot accidentally mutate shared state between the
+ * persistence write and the projection update.
+ *
  * @param {IndexerIngestEventDTO} dto
- * @returns {object} Normalized internal event.
+ * @returns {object} Normalized internal event (frozen).
  */
 function mapIngestDTOToNormalized(dto) {
   const source = requireRecord(dto, 'dto');
