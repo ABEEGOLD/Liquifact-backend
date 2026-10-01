@@ -87,6 +87,65 @@ describe('CORS DTO layer', () => {
       });
     });
 
+    it('does not inherit process maxAge when a custom env omits it', () => {
+      process.env.CORS_MAX_AGE = '7200';
+
+      jest.isolateModules(() => {
+        const { corsConfigDtoFromEnv } = require('../../src/dtos/cors');
+        const dto = corsConfigDtoFromEnv({ NODE_ENV: 'production' });
+
+        expect(dto.maxAge).toBe(600);
+      });
+    });
+
+    it('applies the maxAge boundary to custom environments', () => {
+      jest.isolateModules(() => {
+        const { corsConfigDtoFromEnv } = require('../../src/dtos/cors');
+
+        expect(corsConfigDtoFromEnv({ CORS_MAX_AGE: '86400' }).maxAge).toBe(86400);
+        expect(corsConfigDtoFromEnv({ CORS_MAX_AGE: '86401' }).maxAge).toBe(600);
+      });
+    });
+
+    it('recovers on retry after a parser dependency fails without mutating env', () => {
+      jest.isolateModules(() => {
+        const corsConfig = require('../../src/config/cors');
+        const { corsConfigDtoFromEnv } = require('../../src/dtos/cors');
+        const originalParseMaxAge = corsConfig.parseMaxAge;
+        const env = {
+          NODE_ENV: 'production',
+          CORS_ORIGINS: 'https://app.example.com',
+          CORS_MAX_AGE: '1200',
+        };
+
+        corsConfig.parseMaxAge = jest.fn()
+          .mockImplementationOnce(() => { throw new Error('temporary parser failure'); })
+          .mockImplementation(originalParseMaxAge);
+
+        expect(() => corsConfigDtoFromEnv(env)).toThrow('temporary parser failure');
+        expect(env).toEqual({
+          NODE_ENV: 'production',
+          CORS_ORIGINS: 'https://app.example.com',
+          CORS_MAX_AGE: '1200',
+        });
+
+        expect(corsConfigDtoFromEnv(env)).toMatchObject({
+          allowedOrigins: ['https://app.example.com'],
+          maxAge: 1200,
+        });
+      });
+    });
+
+    it('rejects malformed env input with a stable error code', () => {
+      jest.isolateModules(() => {
+        const { corsConfigDtoFromEnv, CORS_CONFIG_DTO_INVALID_CODE } = require('../../src/dtos/cors');
+
+        expect(() => corsConfigDtoFromEnv(null)).toThrow(expect.objectContaining({
+          code: CORS_CONFIG_DTO_INVALID_CODE,
+        }));
+      });
+    });
+
     it('returns a defensive copy of allowedOrigins', () => {
       jest.isolateModules(() => {
         const { corsConfigDtoFromEnv } = require('../../src/dtos/cors');
@@ -351,6 +410,37 @@ describe('CORS DTO layer', () => {
       });
     });
 
+    it('caps restored and mapped maxAge at the canonical boundary', () => {
+      jest.isolateModules(() => {
+        const { corsConfigDtoFromJson, corsConfigDtoToOptions } = require('../../src/dtos/cors');
+
+        expect(corsConfigDtoFromJson({ maxAge: 86400 }).maxAge).toBe(86400);
+        expect(corsConfigDtoFromJson({ maxAge: 86401 }).maxAge).toBe(600);
+        expect(corsConfigDtoToOptions({ allowedOrigins: [], maxAge: 86401 }).maxAge).toBe(600);
+      });
+    });
+
+    it('returns a stable DTO error for a malformed JSON root and recovers on valid input', () => {
+      jest.isolateModules(() => {
+        const {
+          corsConfigDtoFromJson,
+          CORS_CONFIG_DTO_INVALID_CODE,
+        } = require('../../src/dtos/cors');
+        let error;
+
+        try {
+          corsConfigDtoFromJson(null);
+        } catch (caught) {
+          error = caught;
+        }
+
+        expect(error).toBeInstanceOf(TypeError);
+        expect(error.code).toBe(CORS_CONFIG_DTO_INVALID_CODE);
+        expect(corsConfigDtoFromJson({ allowedOrigins: ['https://app.example.com'] }).allowedOrigins)
+          .toEqual(['https://app.example.com']);
+      });
+    });
+
     it('handles empty allowedOrigins in restore', () => {
       jest.isolateModules(() => {
         const { corsConfigDtoFromJson } = require('../../src/dtos/cors');
@@ -371,6 +461,40 @@ describe('CORS DTO layer', () => {
   // ─── Integration: DTO-built options behave like real cors middleware ───────
 
   describe('DTO → cors middleware integration', () => {
+    it('keeps concurrent and repeated requests on the creation-time policy snapshot', async () => {
+      const { corsConfigDtoToOptions } = require('../../src/dtos/cors');
+      const allowedOrigins = ['https://app.example.com'];
+      const corsOpts = corsConfigDtoToOptions({
+        allowedOrigins,
+        maxAge: 600,
+        optionsSuccessStatus: 204,
+        isDevelopmentFallback: false,
+      });
+      allowedOrigins.push('https://evil.com');
+
+      const app = express();
+      app.use(cors(corsOpts));
+      app.use((err, req, res, next) => {
+        if (err && err.isCorsOriginRejected) {
+          return res.status(403).json({ error: err.message });
+        }
+        next(err);
+      });
+      app.get('/test', (req, res) => res.json({ ok: true }));
+
+      const responses = await Promise.all([
+        request(app).get('/test').set('Origin', 'https://app.example.com'),
+        request(app).get('/test').set('Origin', 'https://evil.com'),
+        request(app).get('/test').set('Origin', 'https://evil.com'),
+        request(app).get('/test'),
+      ]);
+
+      expect(responses.map((response) => response.status)).toEqual([200, 403, 403, 200]);
+      expect(responses[0].headers['access-control-allow-origin']).toBe('https://app.example.com');
+      expect(responses[1].headers['access-control-allow-origin']).toBeUndefined();
+      expect(responses[2].headers['access-control-allow-origin']).toBeUndefined();
+    });
+
     it('allows an origin when using DTO-built options with the cors package', async () => {
       const { corsConfigDtoToOptions } = require('../../src/dtos/cors');
       const dto = {
@@ -516,6 +640,7 @@ describe('CORS DTO layer', () => {
         expect(dtos).toHaveProperty('corsConfigDtoFromJson');
         expect(dtos).toHaveProperty('CORS_ORIGIN_NOT_ALLOWED_CODE');
         expect(dtos).toHaveProperty('CORS_NULL_ORIGIN_CODE');
+        expect(dtos).toHaveProperty('CORS_CONFIG_DTO_INVALID_CODE');
 
         expect(typeof dtos.corsConfigDtoFromEnv).toBe('function');
         expect(typeof dtos.validateOriginDto).toBe('function');
