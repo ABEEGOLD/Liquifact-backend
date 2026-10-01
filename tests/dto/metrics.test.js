@@ -62,10 +62,11 @@ describe('toSmeMetricsResponse', () => {
     expect(result).toEqual({ open: 3, funded: 1, settled: 2, defaulted: 0 });
   });
 
-  it('preserves finite fractional values for backward compatibility', () => {
+  it('coerces float values to integers via floor', () => {
     const result = toSmeMetricsResponse({ open: 2.7, funded: 1.2, settled: 3.9, defaulted: 0.1 });
-    expect(result.open).toBe(2.7);
-    expect(result.funded).toBe(1.2);
+    // _coerceCount floors floats to integers
+    expect(result.open).toBe(2);
+    expect(result.funded).toBe(1);
   });
 
   it('normalizes negative and non-finite counts to zero', () => {
