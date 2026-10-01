@@ -4,8 +4,7 @@
  * @fileoverview Maintenance task that hard-deletes escrow-read records whose
  * soft-delete retention window has elapsed (issue #31).
  *
- * Soft-deleting a record (see {@link module:services/escrowReadSoftDelete})
- * leaves a tombstoned `escrow_event_projection` row behind. Without a purge,
+ * Soft-deleting a record (see {@link module:services/escrowReadSoftDelete}) leaves a tombstoned `escrow_event_projection` row behind. Without a purge,
  * tombstones accumulate forever — the exact unbounded-growth problem the
  * idempotency purge job solves for `idempotency_keys`.
  *
@@ -62,6 +61,12 @@ const DEFAULT_INTERVAL_MS = 6 * 60 * 60 * 1000;
  * @constant {number}
  */
 const MIN_INTERVAL_MS = 60_000; // 1 minute
+/** @constant {number} */
+const DEFAULT_MAX_RETRIES = 3;
+/** @constant {number} */
+const BASE_RETRY_DELAY_MS = 250;
+/** @constant {number} */
+const MAX_RETRY_DELAY_MS = 30_000;
 
 /**
  * Maximum allowed purge interval.
@@ -108,7 +113,7 @@ const MAX_MAX_BATCHES = 1000;
 
 /**
  * Registers a counter idempotently. Jest resets the module registry between
- * suites while `prom-client`'s registry is process-global, so a bare
+ * suites while `prom-client 's registry is process-global, so a bare
  * `new Counter(...)` would throw "already registered" on the second load.
  *
  * @param {object} config - `prom-client` counter configuration.
@@ -132,6 +137,16 @@ const escrowReadPurgeRunsTotal = _counter({
   name: 'liquifact_escrow_read_purge_runs_total',
   help: 'Total escrow-read purge job runs by outcome',
   labelNames: ['status'],
+});
+
+const escrowReadPurgeRetriesTotal = _counter({
+  name: 'liquifact_escrow_read_purge_retries_total',
+  help: 'Total escrow-read purge retry attempts',
+});
+
+const escrowReadPurgeRowsDeletedOnRetryTotal = _counter({
+  name: 'liquifact_escrow_read_purge_rows_deleted_on_retry_total',
+  help: 'Total escrow-read tombstones deleted by retried runs',
 });
 
 /**
@@ -248,6 +263,93 @@ function _sanitiseOptions(raw) {
 }
 
 /**
+ * Reads the maximum number of retries for a failed purge run.
+ *
+ * @param {object} [options={}]
+ * @param {number} [options.maxRetries] - Override for tests/callers.
+ * @returns {number} Non-negative integer.
+ */
+function getMaxRetries(options = {}) {
+  if (Number.isInteger(options.maxRetries) && options.maxRetries >= 0) {
+    return options.maxRetries;
+  }
+  const parsed = parseInt(process.env.ESCROW_READ_PURGE_MAX_RETRIES, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return DEFAULT_MAX_RETRIES;
+  }
+  return parsed;
+}
+
+/**
+ * Computes a deterministic exponential backoff delay for a retry attempt.
+ *
+ * @param {number} attempt - 1-based retry attempt number.
+ * @returns {number} Delay in ms, capped at 30 s.
+ */
+function getRetryDelayMs(attempt) {
+  const delay = BASE_RETRY_DELAY_MS * 2 ** (Math.max(1, attempt) - 1);
+  return Math.min(delay, MAX_RETRY_DELAY_MS);
+}
+
+/**
+ * Sleeps for the given duration. Exposed for testability via the options
+ * bag so tests can inject a no-op sleep.
+ *
+ * @param {number} ms
+ * @returns {Promise<void>}
+ */
+function _sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** In-process mutex guard for the purge handler. */
+let purgeInFlight = null;
+
+/**
+ * Resets the in-flight guard. Test-only hook to keep suites isolated.
+ *
+ * @returns {void}
+ */
+function _resetInFlight() {
+  purgeInFlight = null;
+}
+
+/**
+ * Runs a single purge attempt with metrics and structured logging.
+ *
+ * @param {object} job
+ * @param {object} options
+ * @param {number} attempt
+ * @returns {Promise<object>}
+ */
+async function _attemptPurge(job, options, attempt) {
+  const startedAt = Date.now();
+  const summary = await purgeExpiredSoftDeletes(options);
+
+  escrowReadPurgeRowsDeletedTotal.inc(summary.purged);
+  if (attempt > 1) {
+    escrowReadPurgeRowsDeletedOnRetryTotal.inc(summary.purged);
+  }
+  escrowReadPurgeRunsTotal.inc({ status: 'success' });
+
+  logger.info(
+    {
+      jobId: job.id,
+      attempt,
+      purged: summary.purged,
+      batches: summary.batches,
+      cutoff: summary.cutoff,
+      retentionDays: summary.retentionDays,
+      maxBatchesReached: summary.maxBatchesReached,
+      durationMs: Date.now() - startedAt,
+    },
+    'escrowReadPurge: run completed'
+  );
+
+  return { success: true, attempts: attempt, ...summary };
+}
+
+/**
  * Job handler: purges expired escrow-read tombstones and records metrics.
  *
  * `job` is normalised before accessing `job.id` so non-object callers cannot
@@ -263,14 +365,54 @@ function _sanitiseOptions(raw) {
  *   Invalid field values are individually stripped rather than rejected so
  *   the handler can always make forward progress.
  * @returns {Promise<object>} Purge summary plus `success: true`.
- * @throws {Error} Re-throws the underlying failure after recording metrics so
- *   the worker's retry policy applies.
+ * @throws {Error} Re-throws the underlying failure after recording metrics and
+ *   exhausting retries so the worker's retry policy applies.
  */
 async function runEscrowReadPurge(job = {}, options = {}) {
   const safeJob = _normaliseJob(job);
   const safeOptions = _sanitiseOptions(options);
   const startedAt = Date.now();
 
+  const maxRetries = getMaxRetries(options);
+  const sleep = typeof options.sleep === 'function' ? options.sleep : _sleep;
+
+  const run = (async () => {
+    let lastError = null;
+    for (let attempt = 1; attempt <= maxRetries + 1; attempt += 1) {
+      try {
+        return await _attemptPurge(job, options, attempt);
+      } catch (error) {
+        lastError = error;
+        escrowReadPurgeRunsTotal.inc({ status: 'error' });
+        logger.error(
+          {
+            jobId: job.id,
+            attempt,
+            maxAttempts: maxRetries + 1,
+            errorName: error.name,
+            err: error.message,
+          },
+          'escrowReadPurge: attempt failed'
+        );
+
+        if (attempt > maxRetries) {
+          break;
+        }
+
+        escrowReadPurgeRetriesTotal.inc();
+        const delayMs = getRetryDelayMs(attempt);
+        logger.warn(
+          { jobId: job.id, attempt, delayMs },
+          'escrowReadPurge: retrying after backoff'
+        );
+        await sleep(delayMs);
+      }
+    }
+
+    throw lastError;
+  })();
+
+  purgeInFlight = run;
   try {
     const summary = await purgeExpiredSoftDeletes(safeOptions);
 
@@ -394,12 +536,13 @@ function getStats() {
       batchSize: getPurgeBatchSize(),
       maxBatches: getPurgeMaxBatches(),
       intervalMs: getIntervalMs(),
+      maxRetries: getMaxRetries(),
     },
   };
 }
 
 module.exports = {
-  JOB_TYPE,
+  JOB_TYPE, 
   runEscrowReadPurge,
   schedulePurge,
   startPurgeWorker,
@@ -407,6 +550,9 @@ module.exports = {
   triggerPurge,
   getStats,
   getIntervalMs,
+  getMaxRetries,
+  getRetryDelayMs,
+  _resetInFlight,
   purgeQueue,
   purgeWorker,
   // Exported for testing only — not part of the public API.
