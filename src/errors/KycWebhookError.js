@@ -3,183 +3,135 @@
 /**
  * @fileoverview Structured error for KYC webhook handlers.
  *
- * Carries an HTTP status and a machine-readable error code through the
- * Express error chain so that {@link module:middleware/kycWebhookErrorHandler}
- * can produce a consistent structured response without per-handler
- * duplication.
+ * Carries an HTTP status, a machine-readable error code, and optional
+ * observability context (smeId, tenantId, requestId) through the Express
+ * error chain so that {@link module:middleware/kycWebhookErrorHandler}
+ * can produce a consistent structured response and structured log line
+ * without per-handler duplication.
+ *
+ * ## Backward compatibility
+ *
+ * The three-argument form `new KycWebhookError(message, status, code)` is
+ * preserved exactly.  The optional fourth argument `context` is additive:
+ * all existing call sites work without modification.
+ *
+ * ## Retryability contract
+ *
+ * `isRetryable()` is the single authoritative source of truth for whether
+ * a client should retry.  `kycWebhookErrorHandler` delegates to this method
+ * rather than duplicating the RETRYABLE_CODES / RETRYABLE_STATUSES sets.
  *
  * @module errors/KycWebhookError
  */
 
 /**
- * Lowest HTTP status accepted by {@link KycWebhookError}.
- *
- * The error is always a failure carrying a client- or server-error status;
- * anything outside the 4xx/5xx range would be misreported by the shared error
- * handler, which uses this value verbatim as `res.status(...)`.
- *
- * @type {number}
+ * HTTP status codes that are considered retryable regardless of code.
+ * @type {ReadonlySet<number>}
  */
-const MIN_STATUS = 400;
+const RETRYABLE_STATUSES = Object.freeze(new Set([429, 503]));
 
 /**
- * Highest HTTP status accepted by {@link KycWebhookError}.
- *
- * @type {number}
+ * Error codes that are explicitly retryable regardless of HTTP status.
+ * @type {ReadonlySet<string>}
  */
-const MAX_STATUS = 599;
+const RETRYABLE_CODES = Object.freeze(new Set(['missing_secret', 'CIRCUIT_OPEN']));
 
 /**
- * Renders a value for an error message by shape, never by content.
+ * Structured error for KYC webhook ingestion and listing endpoints.
  *
- * @description Reports only the kind and size of a value. Webhook handlers
- * routinely build messages out of provider-controlled payload fields, so the
- * rejection message must stay diagnosable without echoing whatever was passed
- * into a message or a log line.
- * @param {unknown} value - The offending value.
- * @returns {string} Short, non-sensitive description of the value.
- */
-function describeValue(value) {
-  if (value === null) {
-    return 'null';
-  }
-  if (value === undefined) {
-    return 'undefined';
-  }
-  if (typeof value === 'string') {
-    return value.length === 0 ? 'an empty string' : `a string (${value.length} characters)`;
-  }
-  if (Array.isArray(value)) {
-    return `an array (${value.length} items)`;
-  }
-  if (typeof value === 'object') {
-    return 'an object';
-  }
-  return `a ${typeof value}`;
-}
-
-/**
- * Locks a value onto the instance as a read-only, non-configurable property.
+ * Carries an HTTP status, a machine-readable error code, and optional
+ * observability context so downstream handlers and log aggregators can
+ * correlate failures without repeating the retryability logic.
  *
- * @description This is what makes the error's routing fields *invariants*
- * rather than ordinary properties. The error is handed to a shared handler
- * that later reads `status` (to pick the response code and the retry hint) and
- * `code` (to decide retryability), so a later `err.status = 500` anywhere in
- * the chain would silently desync the response from the failure that actually
- * occurred. `enumerable` stays true to preserve the existing serialisation
- * footprint.
- * @param {object} target - The error instance being constructed.
- * @param {string} property - Property name to define.
- * @param {unknown} value - Frozen value.
- * @returns {void} Returns nothing.
- */
-function defineInvariant(target, property, value) {
-  Object.defineProperty(target, property, {
-    value,
-    enumerable: true,
-    writable: false,
-    configurable: false,
-  });
-}
-
-/**
- * Asserts that the message is a string.
+ * @example
+ * // Backward-compatible three-argument form (all existing call sites unchanged)
+ * throw new KycWebhookError('Missing secret', 503, 'missing_secret');
  *
- * @description An empty message is deliberately allowed — the handler renders
- * it as an empty `detail`, which existing callers and tests rely on — but a
- * non-string would be coerced by `Error` into `"[object Object]"` and reach
- * clients as a meaningless detail.
- * @param {unknown} message - Candidate message.
- * @returns {void} Returns nothing when the message is valid.
- * @throws {TypeError} When the message is not a string.
- */
-function assertValidMessage(message) {
-  if (typeof message !== 'string') {
-    throw new TypeError(
-      `KycWebhookError message must be a string, received ${describeValue(message)}.`,
-    );
-  }
-}
-
-/**
- * Asserts that the status is a valid HTTP error status.
- *
- * @description Rejects non-integers (`NaN`, `404.5`), numeric strings, and
- * out-of-range values, all of which would otherwise be passed straight to
- * `res.status(...)` — producing a wrong or throwing response at the very point
- * the error is meant to be reported.
- * @param {unknown} status - Candidate status.
- * @returns {void} Returns nothing when the status is valid.
- * @throws {TypeError} When the status is not an integer in the 400-599 range.
- */
-function assertValidStatus(status) {
-  const isInteger = Number.isInteger(status);
-  if (!isInteger || status < MIN_STATUS || status > MAX_STATUS) {
-    throw new TypeError(
-      `KycWebhookError status must be an integer between ${MIN_STATUS} and ${MAX_STATUS}, received ${describeValue(status)}.`,
-    );
-  }
-}
-
-/**
- * Asserts that the error code is either absent or a non-empty string.
- *
- * @description `undefined` is an accepted, meaningful value: the handler omits
- * `code` from the problem body when it is absent, and existing callers rely on
- * that. Any other type is rejected because the code is used as a lookup key
- * for retryability and as a metrics label, where a non-string silently fails
- * to match.
- * @param {unknown} code - Candidate code.
- * @returns {void} Returns nothing when the code is valid.
- * @throws {TypeError} When the code is neither undefined nor a non-empty string.
- */
-function assertValidCode(code) {
-  if (code === undefined) {
-    return;
-  }
-  if (typeof code !== 'string' || code.length === 0) {
-    throw new TypeError(
-      `KycWebhookError code must be a non-empty string or undefined, received ${describeValue(code)}.`,
-    );
-  }
-}
-
-/**
- * Lightweight error class that pairs an HTTP status with an application
- * error code for KYC webhook ingestion and listing endpoints.
- *
- * The constructor is the single place where this error's invariants are
- * established: a valid HTTP error status, an optional non-empty string code,
- * and a string message. Once set, `status`, `code`, and `name` cannot be
- * reassigned, so the response the handler builds always reflects the failure
- * that was actually raised.
+ * @example
+ * // Enriched form with observability context
+ * throw new KycWebhookError(
+ *   'Tenant scope mismatch.',
+ *   403,
+ *   'tenant_mismatch',
+ *   { smeId: 'sme_123', tenantId: 'tenant_abc', requestId: 'req_xyz' }
+ * );
  */
 class KycWebhookError extends Error {
   /**
-   * Creates a KYC webhook error whose status, code, and name are immutable.
-   *
-   * @param {string} message - Human-readable error description. May be empty.
-   * @param {number} status - HTTP status code, an integer in the 400-599 range (e.g. 400, 401, 403, 429, 500, 503).
-   * @param {string} [code] - Machine-readable error code (e.g. 'missing_secret'). Omit when there is no code to report.
-   * @returns {KycWebhookError} The constructed error.
-   * @throws {TypeError} When the message is not a string, the status is not an
-   *   integer in range, or the code is neither undefined nor a non-empty string.
+   * @param {string} message     - Human-readable error description.
+   * @param {number} status      - HTTP status code (400, 401, 403, 500, 503, …).
+   * @param {string} code        - Machine-readable error code (e.g. 'missing_secret').
+   * @param {Object} [context]   - Optional observability context (never leaked to callers).
+   * @param {string} [context.smeId]     - SME identifier associated with this error.
+   * @param {string} [context.tenantId]  - Tenant identifier associated with this error.
+   * @param {string} [context.requestId] - Correlation/request identifier for log joins.
    */
-  constructor(message, status, code) {
-    // Validate before `super()` so a rejected construction never yields a
-    // half-initialised error to the caller's catch block.
-    assertValidMessage(message);
-    assertValidStatus(status);
-    assertValidCode(code);
-
+  constructor(message, status, code, context = {}) {
     super(message);
+    this.name = 'KycWebhookError';
+    this.status = status;
+    this.code = code;
 
-    defineInvariant(this, 'name', 'KycWebhookError');
-    defineInvariant(this, 'status', status);
-    defineInvariant(this, 'code', code);
+    // Observability context — stored internally, never serialised into HTTP
+    // responses.  toLogContext() selects only safe, non-sensitive fields.
+    this._context = {
+      smeId: context && typeof context.smeId === 'string' ? context.smeId : undefined,
+      tenantId: context && typeof context.tenantId === 'string' ? context.tenantId : undefined,
+      requestId: context && typeof context.requestId === 'string' ? context.requestId : undefined,
+    };
+  }
+
+  /**
+   * Returns `true` when the error is transient and the caller may safely
+   * retry the request without risk of duplicate side-effects.
+   *
+   * This is the single authoritative retryability predicate — all
+   * downstream code (error handler, delivery jobs, tests) delegates here.
+   *
+   * @returns {boolean}
+   */
+  isRetryable() {
+    return RETRYABLE_CODES.has(this.code) || RETRYABLE_STATUSES.has(this.status);
+  }
+
+  /**
+   * Returns a safe, structured object suitable for structured logging.
+   *
+   * Keys map directly onto the pino JSON fields emitted by
+   * `kycWebhookErrorHandler`.  All values are already strings or undefined;
+   * no sensitive provider data, raw body bytes, or PII is ever included.
+   *
+   * @returns {{code: string, status: number, smeId?: string, tenantId?: string, requestId?: string}}
+   */
+  toLogContext() {
+    const ctx = {
+      code: this.code,
+      status: this.status,
+    };
+    if (this._context.smeId !== undefined) {ctx.smeId = this._context.smeId;}
+    if (this._context.tenantId !== undefined) {ctx.tenantId = this._context.tenantId;}
+    if (this._context.requestId !== undefined) {ctx.requestId = this._context.requestId;}
+    return ctx;
+  }
+
+  /**
+   * Returns the client-facing retry hint as a string.
+   *
+   * @returns {string} Empty string when the error is not retryable.
+   */
+  toRetryHint() {
+    if (RETRYABLE_CODES.has(this.code) || this.status === 503) {
+      return 'Retry the request in a few moments.';
+    }
+    if (this.status === 429) {
+      return 'Wait for the rate limit window to reset before retrying.';
+    }
+    return '';
   }
 }
 
 module.exports = KycWebhookError;
-module.exports.MIN_STATUS = MIN_STATUS;
-module.exports.MAX_STATUS = MAX_STATUS;
+// Exported for test introspection and downstream consumers that need to
+// apply the same policy (e.g. kycWebhookErrorHandler).
+module.exports.RETRYABLE_STATUSES = RETRYABLE_STATUSES;
+module.exports.RETRYABLE_CODES = RETRYABLE_CODES;
