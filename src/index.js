@@ -21,7 +21,6 @@
 
 require('dotenv').config();
 
-const crypto = require('crypto');
 const app = require('./app');
 const { validate, logRedactedSummary } = require('./config');
 const {
@@ -31,6 +30,7 @@ const {
 } = require('./config/listenPort');
 const logger = require('./logger');
 const shutdownCoordinator = require('./utils/shutdownCoordinator');
+const logger = require('./logger');
 
 /**
  * The single HTTP listener owned by this process, or `null` when nothing is
@@ -58,8 +58,11 @@ async function scheduleStartupStorageProbe() {
   try {
     const storage = require('./services/storage');
     await storage.runStartupStorageProbe();
-  } catch (_err) {
-    // Best-effort: a probe failure must not abort startup.
+  } catch (error) {
+    logger.warn(
+      { component: 's3-healthcheck', event: 'startup_probe', errorName: error && error.name },
+      'S3 startup probe could not complete; readiness checks will report storage status'
+    );
   }
 }
 
@@ -180,49 +183,11 @@ function attachServerLifecycleHandlers(server, port) {
  *   `undefined` when boot validation rejected the configuration.
  * @throws {PortValidationError} If the resolved port is not a usable port.
  */
-function startServer(portOverride) {
-  if (!runBootConfigValidation()) {
-    return undefined;
-  }
-
-  const { port, source } = resolveListenPort(portOverride);
-
-  if (httpServer) {
-    logger.warn(
-      { component: 'entrypoint', event: 'http_server_start_ignored', port, source },
-      'startServer() called while a listener is already running; returning the running server.'
-    );
-    return httpServer;
-  }
-
-  logger.info(
-    { component: 'entrypoint', event: 'http_server_starting', port, source },
-    'Starting HTTP server.'
-  );
-
-  let server;
-  try {
-    server = app.listen(port);
-  } catch (err) {
-    // The slot is only claimed after a successful bind, so a synchronous
-    // failure leaves the process able to retry rather than wedged on a server
-    // that was never created.
-    logger.error(
-      {
-        component: 'entrypoint',
-        event: 'http_server_bind_failed',
-        port,
-        source,
-        errorCode: err && err.code,
-        errorName: err && err.name,
-      },
-      'app.listen() threw while binding the HTTP server.'
-    );
-    throw err;
-  }
-
-  httpServer = server;
-  attachServerLifecycleHandlers(server, port);
+function listenServer() {
+  const port = process.env.PORT || 3001;
+  // Fire-and-forget probe -- do not await, so startup is not blocked.
+  scheduleStartupStorageProbe();
+  const server = app.listen(port);
   shutdownCoordinator.register({ server });
   shutdownCoordinator.setupSignalListeners();
 
@@ -232,6 +197,94 @@ function startServer(portOverride) {
   scheduleStartupStorageProbe();
 
   return server;
+}
+
+function startServer() {
+  runBootConfigValidation();
+  return listenServer();
+}
+
+let backgroundWorkersStartPromise = null;
+
+/**
+ * Starts all process-owned workers as one startup operation.
+ * Successful starts are rolled back in reverse order if a later worker fails.
+ *
+ * @returns {Promise<void>}
+ */
+function startBackgroundWorkers() {
+  if (!backgroundWorkersStartPromise) {
+    backgroundWorkersStartPromise = startBackgroundWorkersOnce().catch((error) => {
+      backgroundWorkersStartPromise = null;
+      throw error;
+    });
+  }
+  return backgroundWorkersStartPromise;
+}
+
+async function startBackgroundWorkersOnce() {
+  const startedWorkers = [];
+  try {
+    const idempotencyPurge = require('./jobs/idempotencyPurge');
+    await idempotencyPurge.startPurgeWorker();
+    startedWorkers.push(idempotencyPurge);
+
+    const invoiceStatePurge = require('./jobs/invoiceStatePurge');
+    await invoiceStatePurge.startPurgeWorker();
+    startedWorkers.push(invoiceStatePurge);
+
+    for (const job of startedWorkers) {
+      shutdownCoordinator.register({ worker: job.purgeWorker });
+    }
+  } catch (error) {
+    for (const job of startedWorkers.reverse()) {
+      try {
+        await job.stopPurgeWorker();
+      } catch (stopError) {
+        logger.error(
+          { component: job.JOB_TYPE || 'idempotency_purge', errorName: stopError && stopError.name },
+          'Background worker rollback failed'
+        );
+      }
+    }
+    throw error;
+  }
+}
+
+async function stopBackgroundWorkers() {
+  const jobs = [
+    require('./jobs/invoiceStatePurge'),
+    require('./jobs/idempotencyPurge'),
+  ];
+  for (const job of jobs) {
+    try {
+      await job.stopPurgeWorker();
+    } catch (error) {
+      logger.error(
+        { component: job.JOB_TYPE || 'idempotency_purge', errorName: error && error.name },
+        'Background worker shutdown failed during startup recovery'
+      );
+    }
+  }
+}
+
+async function startApplication() {
+  runBootConfigValidation();
+  let workersStarted = false;
+  try {
+    await startBackgroundWorkers();
+    workersStarted = true;
+    listenServer();
+  } catch (error) {
+    if (workersStarted) {
+      await stopBackgroundWorkers();
+    }
+    logger.error(
+      { component: 'startup', errorName: error && error.name, errorCode: error && error.code },
+      'Application startup failed'
+    );
+    process.exitCode = 1;
+  }
 }
 
 /**
@@ -277,25 +330,13 @@ function createApp() {
 
 // Start background workers when running as main module (not in tests)
 if (process.env.NODE_ENV !== 'test' && require.main === module) {
-  // Start the idempotency purge worker. A unique fencing token is generated
-  // per process at boot time and validated by startPurgeWorker — a missing or
-  // malformed token fails loudly rather than silently in non-test environments.
-  // Each job module owns its own start/stop guard, so this call is idempotent.
-  const { startPurgeWorker } = require('./jobs/idempotencyPurge');
-  startPurgeWorker({ fencingToken: crypto.randomUUID() });
-
-  // Start the invoice-state retention purge worker (issue #866). It keeps its
-  // own lifecycle state, independent of the idempotency worker. The same
-  // fencing-token invariant applies.
-  const { startPurgeWorker: startInvoiceStatePurgeWorker } = require('./jobs/invoiceStatePurge');
-  startInvoiceStatePurgeWorker({ fencingToken: crypto.randomUUID() });
-
-  startServer();
+  startApplication();
 }
 
 module.exports = app;
 module.exports.createApp = createApp;
 module.exports.startServer = startServer;
+module.exports.startBackgroundWorkers = startBackgroundWorkers;
 module.exports.resetStore = resetStore;
 module.exports.getHttpServer = getHttpServer;
 module.exports.PortValidationError = PortValidationError;
