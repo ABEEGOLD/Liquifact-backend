@@ -40,6 +40,16 @@ const logger = require('./logger');
 let httpServer = null;
 
 /**
+ * Module-level startup state guards to prevent concurrent/duplicate initialization.
+ * @type {{ isServerStarted: boolean, serverInstance: import('http').Server|null, fencingTokens: Map<string, string> }}
+ */
+const startupState = {
+  isServerStarted: false,
+  serverInstance: null,
+  fencingTokens: new Map(),
+};
+
+/**
  * Runs the S3 connectivity probe at startup. Failures are logged but never
  * block process start - the readiness probe (`/readyz`) surfaces storage
  * misconfiguration to orchestrators once the HTTP server is listening.
@@ -159,6 +169,7 @@ function attachServerLifecycleHandlers(server, port) {
 
 /**
  * Starts the HTTP server on the configured port.
+ * Idempotent: if already started, returns the existing server instance.
  *
  * Performs boot-time configuration validation, schedules a non-blocking storage
  * connectivity probe, registers the server with the shutdown coordinator, and sets
@@ -170,12 +181,21 @@ function attachServerLifecycleHandlers(server, port) {
  * @throws {Error} May throw if server fails to bind to the specified port.
  *                   Configuration validation failures exit the process instead of throwing.
  */
-function startServer(port) {
+function startServer() {
+  if (startupState.isServerStarted && startupState.serverInstance) {
+    console.warn('[index] startServer called multiple times; returning existing server instance');
+    return startupState.serverInstance;
+  }
+
   runBootConfigValidation();
   const serverPort = port !== undefined ? port : process.env.PORT || 3001;
   // Fire-and-forget probe -- do not await, so startup is not blocked.
   scheduleStartupStorageProbe();
-  const server = app.listen(serverPort);
+  const server = app.listen(port);
+  
+  startupState.isServerStarted = true;
+  startupState.serverInstance = server;
+  
   shutdownCoordinator.register({ server });
   shutdownCoordinator.setupSignalListeners();
 
@@ -315,6 +335,27 @@ function resetStore() {
   }
 }
 
+/**
+ * Gets the fencing token for a specific worker type.
+ * Used by workers to validate their lease fencing.
+ *
+ * @param {string} workerType - The worker type (e.g., 'idempotencyPurge', 'invoiceStatePurge')
+ * @returns {string|undefined} The fencing token, or undefined if not set
+ */
+function getFencingToken(workerType) {
+  return startupState.fencingTokens.get(workerType);
+}
+
+/**
+ * Resets startup state for test isolation.
+ * @private
+ */
+function _resetStartupState() {
+  startupState.isServerStarted = false;
+  startupState.serverInstance = null;
+  startupState.fencingTokens.clear();
+}
+
 const originalCreateApp = app.createApp;
 
 /**
@@ -338,15 +379,22 @@ function createApp(options) {
 
 // Start background workers when running as main module (not in tests)
 if (process.env.NODE_ENV !== 'test' && require.main === module) {
+  // Generate and store fencing tokens for lease fencing
+  const idempotencyFencingToken = crypto.randomUUID();
+  const invoiceStateFencingToken = crypto.randomUUID();
+  
+  startupState.fencingTokens.set('idempotencyPurge', idempotencyFencingToken);
+  startupState.fencingTokens.set('invoiceStatePurge', invoiceStateFencingToken);
+
   // Start the idempotency purge worker with a fresh fencing token so that stale
   // workers from a previous process can no longer write after lease loss.
   const { startPurgeWorker } = require('./jobs/idempotencyPurge');
-  startPurgeWorker({ fencingToken: crypto.randomUUID() });
+  startPurgeWorker({ fencingToken: idempotencyFencingToken });
 
   // Start the invoice-state retention purge worker (issue #866) with its own
   // fencing token, isolated from the idempotency worker's token.
   const { startPurgeWorker: startInvoiceStatePurgeWorker } = require('./jobs/invoiceStatePurge');
-  startInvoiceStatePurgeWorker({ fencingToken: crypto.randomUUID() });
+  startInvoiceStatePurgeWorker({ fencingToken: invoiceStateFencingToken });
 
   // Start the escrow-read tombstone purge worker (issue #31). Hard-deletes
   // soft-deleted escrow_event_projection rows whose retention window has
@@ -372,5 +420,5 @@ module.exports.createApp = createApp;
 module.exports.startServer = startServer;
 module.exports.startBackgroundWorkers = startBackgroundWorkers;
 module.exports.resetStore = resetStore;
-module.exports.getHttpServer = getHttpServer;
-module.exports.PortValidationError = PortValidationError;
+module.exports.getFencingToken = getFencingToken;
+module.exports._resetStartupState = _resetStartupState;
