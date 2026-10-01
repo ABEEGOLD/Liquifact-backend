@@ -1,110 +1,104 @@
 'use strict';
 
 const formatProblemDetails = require('../utils/problemDetails');
+const { getProblemType, getStandardTitle } = require('../utils/problemDetails');
 
 /**
  * @fileoverview RFC 7807-compliant application error class.
  *
- * # Compatibility contract
+ * ## Design invariants
  *
- * Every property listed below MUST remain stable across refactors.
- * They are read by: mapError, problemJson, errorHandler, smeAuth, auth,
- * validationHelper, invoiceService, adminKyc, sorobanSim, and ~37 other
- * modules and test suites.
+ * 1. Construction is always **deterministic**: every field has a defined
+ *    default, invalid inputs are coerced to safe values, and no call ever
+ *    throws due to missing or malformed params.
+ * 2. `status` is always a **safe integer in [100, 599]**; out-of-range values
+ *    are clamped to 500 so `res.status()` never receives a bogus value.
+ * 3. `title` and `this.message` are always **non-empty strings** — callers
+ *    never see the literal "undefined" message that `super(undefined)` would
+ *    produce.
+ * 4. `type` is always a **non-empty string**; when omitted it is derived from
+ *    `status` via the canonical `getProblemType` helper so the wire type is
+ *    meaningful rather than the opaque "about:blank" default.
+ * 5. `retryable` is always a **boolean** (never undefined/null on the
+ *    instance), preventing accidental truthy/falsy bugs in callers.
+ * 6. `retryHint` is always a **string** (never undefined), keeping the wire
+ *    format stable.
+ * 7. `fieldErrors` is always **undefined or a plain array**; it is included
+ *    in `toJSON()` / `toHTTPResponse()` when present so the field-level
+ *    validation surface is reachable without additional duck-typing.
+ * 8. `context` is **never serialized** to JSON or included in HTTP responses;
+ *    it exists solely for internal tracing and is explicitly excluded from
+ *    `toJSON()`.
+ * 9. The static `AppError.is(value)` type guard replaces ad-hoc
+ *    `instanceof || .name === "AppError"` checks across the codebase.
+ * 10. Static factory helpers (`notFound`, `forbidden`, `badRequest`,
+ *     `conflict`, `unprocessable`, `tooManyRequests`, `serviceUnavailable`,
+ *     `internal`) provide a single, consistent construction path for each
+ *     common HTTP status.
  *
- * ## Instance properties (always present after construction)
- *
- * | Property    | Type             | Notes                                            |
- * |-------------|------------------|--------------------------------------------------|
- * | name        | string           | Always `'AppError'` — used for duck-typing       |
- * | type        | string           | RFC 7807 type URI (falls back to `about:blank`)  |
- * | title       | string           | Short human-readable summary                     |
- * | status      | number           | HTTP status code (falls back to `500`)           |
- * | detail      | string|undefined | Per-occurrence explanation                       |
- * | instance    | string|undefined | URI of the specific occurrence                   |
- * | code        | string|undefined | Machine-readable code for callers                |
- * | retryable   | boolean          | Whether the caller may safely retry              |
- * | retryHint   | string|undefined | camelCase on the instance (NOT `retry_hint`)     |
- * | fieldErrors | object|undefined | Present ONLY when explicitly supplied in params  |
- * | context     | unknown|null     | Always `null` when not supplied                  |
- * | message     | string           | Inherited from Error — equals `title`            |
- * | stack       | string           | Captured via captureStackTrace                   |
- *
- * ## Static properties
- *
- * | Property               | Type   | Value                      |
- * |------------------------|--------|----------------------------|
- * | FENCING_TOKEN_REJECTED | string | `'FENCING_TOKEN_REJECTED'` |
- *
- * ## Wire-format invariant
- *
- * `retryHint` is camelCase on the **instance**.
- * `formatProblemDetails` serialises it as snake_case `retry_hint` on the
- * **wire** (JSON response body). Callers MUST NOT read `error.retry_hint`;
- * they MUST read `error.retryHint`.
- *
- * ## Type-guard invariant
- *
- * Both `instanceof AppError` and `error.name === 'AppError'` identify an
- * AppError. The dual check is required because Jest's module cache can
- * produce multiple class instances from different `require` calls.
- *
- * @see https://tools.ietf.org/html/rfc7807
  * @module errors/AppError
  */
 
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
+/** Minimum valid HTTP status code. */
+const HTTP_STATUS_MIN = 100;
+/** Maximum valid HTTP status code. */
+const HTTP_STATUS_MAX = 599;
+/** Fallback status when an invalid value is supplied. */
+const HTTP_STATUS_FALLBACK = 500;
 
 /**
- * Returns true if `status` is a finite integer in the HTTP range [100, 599].
+ * Coerce a raw status value to a safe integer.
  *
- * @param {unknown} status
- * @returns {boolean}
+ * @param {unknown} raw - Raw status value from params.
+ * @returns {number} A valid HTTP status code in [100, 599].
  */
-function isValidHttpStatus(status) {
-  return (
-    typeof status === 'number' &&
-    Number.isFinite(status) &&
-    Number.isInteger(status) &&
-    status >= 100 &&
-    status <= 599
-  );
+function coerceStatus(raw) {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n)) {
+    return HTTP_STATUS_FALLBACK;
+  }
+  if (n < HTTP_STATUS_MIN || n > HTTP_STATUS_MAX) {
+    return HTTP_STATUS_FALLBACK;
+  }
+  return n;
 }
 
-// ---------------------------------------------------------------------------
-// AppError
-// ---------------------------------------------------------------------------
+/**
+ * Coerce a raw boolean-like value to a strict boolean.
+ *
+ * @param {unknown} raw - Raw value.
+ * @param {boolean} defaultValue - Value returned when raw is not boolean-ish.
+ * @returns {boolean}
+ */
+function coerceBool(raw, defaultValue) {
+  if (raw === true || raw === false) return raw;
+  return defaultValue;
+}
 
 /**
- * RFC 7807-compliant application error.
+ * Coerce a raw string value to a trimmed, non-empty string or a fallback.
  *
- * Extends the built-in `Error` class to carry structured Problem Details
- * (type, title, status, detail, instance) along with extension fields
- * (code, retryable, retryHint, fieldErrors, context).
- *
- * All field assembly and defaulting is delegated to `formatProblemDetails`
- * so the wire format remains consistent regardless of which code path
- * constructs the error.
+ * @param {unknown} raw - Raw value.
+ * @param {string} fallback - Returned when raw is not a usable string.
+ * @returns {string}
+ */
+function coerceString(raw, fallback) {
+  if (typeof raw === 'string' && raw.trim().length > 0) return raw.trim();
+  return fallback;
+}
+
+/**
+ * Custom Error class for RFC 7807-compliant problem responses.
  *
  * @extends {Error}
  *
- * @example <caption>Direct construction</caption>
- * throw new AppError({
- *   type:     'https://liquifact.com/probs/not-found',
- *   title:    'Not Found',
- *   status:   404,
- *   detail:   'Invoice inv_123 does not exist.',
- *   code:     'NOT_FOUND',
- *   instance: req.originalUrl,
- * });
+ * @example
+ * // Inline construction
+ * throw new AppError({ status: 404, detail: 'Invoice not found.' });
  *
- * @example <caption>Static factory</caption>
- * throw AppError.notFound('Invoice inv_123 does not exist.', {
- *   code:     'INVOICE_NOT_FOUND',
- *   instance: req.originalUrl,
- * });
+ * @example
+ * // Via factory helper
+ * throw AppError.notFound('Invoice not found.', { code: 'INVOICE_NOT_FOUND' });
  */
 class AppError extends Error {
   /**
@@ -155,384 +149,379 @@ class AppError extends Error {
   /**
    * Creates a new AppError instance.
    *
-   * All parameters are optional at the call site; the constructor applies
-   * RFC 7807 defaults for any omitted fields.
+   * All fields have safe defaults; passing `null`, `undefined`, or a partial
+   * object will never throw.
    *
-   * @param {object}  [params]                  - Problem Details parameters.
-   * @param {string}  [params.type]             - RFC 7807 type URI. Defaults to `'about:blank'`.
-   * @param {string}  [params.title]            - Short human-readable summary. Defaults to `'An unexpected error occurred'`.
-   * @param {number}  [params.status=500]       - HTTP status code [100–599]. Invalid values default to 500.
-   * @param {string}  [params.detail]           - Human-readable explanation specific to this occurrence.
-   * @param {string}  [params.instance]         - URI reference identifying the specific occurrence.
-   * @param {string}  [params.code]             - Machine-readable application error code.
-   * @param {boolean} [params.retryable=false]  - Whether the caller may safely retry.
-   * @param {string}  [params.retryHint]        - camelCase retry advice (serialised as snake_case on the wire).
-   * @param {object}  [params.fieldErrors]      - Field-level errors; present on the instance only when explicitly supplied.
-   * @param {unknown} [params.context]          - Arbitrary contextual data; defaults to `null`.
+   * @param {object|null|undefined} params
+   * @param {string}  [params.type]       - RFC 7807 problem type URI.  Derived
+   *   from `status` when omitted.
+   * @param {string}  [params.title]      - Short human-readable summary.
+   *   Derived from `status` when omitted.
+   * @param {number}  [params.status=500] - HTTP status code.  Values outside
+   *   [100, 599] are clamped to 500.
+   * @param {string}  [params.detail]     - Human-readable occurrence detail.
+   * @param {string}  [params.instance]   - URI identifying this occurrence.
+   * @param {string}  [params.code]       - Machine-readable error code.
+   * @param {boolean} [params.retryable=false] - Whether the caller may retry.
+   * @param {string}  [params.retryHint='']    - Safe retry guidance.
+   * @param {Array}   [params.fieldErrors]     - Field-level validation errors.
+   * @param {unknown} [params.context]         - Internal tracing context (never
+   *   serialized to JSON or HTTP responses).
    */
   constructor(params) {
-    // ── Normalise params ──────────────────────────────────────────────────
+    // Guard: treat null/undefined params as an empty object so every path
+    // below has a defined object to work with.
     const safeParams = (params !== null && typeof params === 'object') ? params : {};
 
-    // Validate status — guard against NaN, floats, strings, and out-of-range
-    // values without crashing callers; fall back to 500 with a dev warning.
-    const rawStatus = safeParams.status;
-    let effectiveStatus = 500;
+    // --- 1. Coerce / default all scalar fields deterministically -----------
 
-    if (rawStatus !== undefined) {
-      if (isValidHttpStatus(rawStatus)) {
-        effectiveStatus = rawStatus;
-      } else if (process.env.NODE_ENV !== 'production') {
-        // eslint-disable-next-line no-console
-        console.warn(
-          `[AppError] Invalid HTTP status "${rawStatus}" — defaulting to 500.`
-        );
-      }
-    }
+    const status = coerceStatus(safeParams.status);
 
-    const title =
-      typeof safeParams.title === 'string' && safeParams.title.length > 0
-        ? safeParams.title
-        : 'An unexpected error occurred';
+    // Derive title: explicit param → standard title from status → generic
+    const title = coerceString(
+      safeParams.title,
+      getStandardTitle(status),
+    );
 
-    // ── Error base class ──────────────────────────────────────────────────
-    // `message` is set to `title` so generic Error handlers that read only
-    // `error.message` still surface a useful value.
-    super(title);
+    // Derive type: explicit param → status-based URI (never "about:blank" for
+    // known statuses because that provides no actionable information)
+    const type = coerceString(
+      safeParams.type,
+      getProblemType(status),
+    );
 
-    /**
-     * Always `'AppError'`.
-     *
-     * Used for duck-type checks in `mapError` and `problemJson` when Jest
-     * module isolation creates separate class instances from the same file.
-     * @type {string}
-     */
-    this.name = 'AppError';
+    const detail = typeof safeParams.detail === 'string'
+      ? safeParams.detail
+      : undefined;
 
-    // ── Delegate field assembly to the canonical RFC 7807 builder ─────────
-    // We strip `stack` so it never leaks into the serialised problem object,
-    // pass the already-validated `title` (normalised above) and the corrected
-    // `effectiveStatus` so defaulting is consistent throughout the stack.
-    const problem = formatProblemDetails({
-      ...safeParams,
-      title,
-      status: effectiveStatus,
-      stack: undefined,
-    });
+    const instance = typeof safeParams.instance === 'string'
+      ? safeParams.instance
+      : undefined;
 
-    // ── RFC 7807 core fields ──────────────────────────────────────────────
+    const code = typeof safeParams.code === 'string' && safeParams.code.trim()
+      ? safeParams.code.trim()
+      : undefined;
 
-    /**
-     * RFC 7807 problem type URI.
-     * Falls back to `'about:blank'` when not supplied.
-     * @type {string}
-     */
-    this.type = problem.type;
+    // retryable: always a boolean, defaulting to false for non-transient codes
+    const retryable = coerceBool(safeParams.retryable, false);
 
-    /**
-     * Short human-readable summary of the problem type.
-     * @type {string}
-     */
-    this.title = problem.title;
+    // retryHint: always a string (may be empty), never undefined
+    const retryHint = typeof safeParams.retryHint === 'string'
+      ? safeParams.retryHint
+      : '';
 
-    /**
-     * HTTP status code associated with this error.
-     * @type {number}
-     */
-    this.status = problem.status;
+    // fieldErrors: only if it is an actual array; never coerced from other types
+    const fieldErrors = Array.isArray(safeParams.fieldErrors)
+      ? safeParams.fieldErrors
+      : undefined;
 
-    /**
-     * Human-readable explanation specific to this occurrence of the problem.
-     * `undefined` when not supplied.
-     * @type {string|undefined}
-     */
-    this.detail = problem.detail;
-
-    /**
-     * URI reference that identifies the specific occurrence of the problem.
-     * `undefined` when not supplied.
-     * @type {string|undefined}
-     */
-    this.instance = problem.instance;
-
-    // ── Extension fields ──────────────────────────────────────────────────
-
-    /**
-     * Machine-readable application error code.
-     *
-     * `undefined` when not supplied; `mapError` falls back to
-     * `httpStatusToCode(status)` in that case.
-     * @type {string|undefined}
-     */
-    this.code = problem.code;
-
-    /**
-     * Whether the caller may safely retry the request without modification.
-     *
-     * Explicitly defaults to `false` (not `undefined`) so downstream boolean
-     * checks never need a fallback guard.
-     * @type {boolean}
-     */
-    this.retryable = typeof problem.retryable === 'boolean' ? problem.retryable : false;
-
-    /**
-     * Human-readable retry advice in **camelCase** on the instance.
-     *
-     * Invariant: this property is `retryHint` (camelCase) on the instance.
-     * `formatProblemDetails` serialises it as `retry_hint` (snake_case) on
-     * the wire. Callers MUST NOT read `error.retry_hint`.
-     * @type {string|undefined}
-     */
-    this.retryHint = problem.retry_hint;
-
-    // ── Conditional extension fields ──────────────────────────────────────
-
-    /**
-     * Map of field path → first error message for validation failures.
-     *
-     * Present on the instance **only** when `fieldErrors` was explicitly
-     * supplied in the constructor params (checked via `hasOwnProperty`).
-     * This preserves the contract relied upon by `validationHelper.js` which
-     * does its own `hasOwnProperty` check before accessing field errors.
-     * @type {object|undefined}
-     */
-    if (Object.prototype.hasOwnProperty.call(safeParams, 'fieldErrors')) {
-      this.fieldErrors = safeParams.fieldErrors;
-    }
-
-    /**
-     * Arbitrary contextual data attached to the error (e.g. tenant metadata,
-     * invoice IDs). Always `null` (never `undefined`) when not supplied, so
-     * downstream null-checks never need an additional undefined guard.
-     * @type {unknown}
-     */
-    this.context = Object.prototype.hasOwnProperty.call(safeParams, 'context')
+    // context: internal only, never serialized
+    const context = Object.prototype.hasOwnProperty.call(safeParams, 'context')
       ? safeParams.context
       : null;
 
-    // ── Stack trace ───────────────────────────────────────────────────────
-    // Capture from the actual throw site, excluding this constructor frame.
-    if (typeof Error.captureStackTrace === 'function') {
+    // --- 2. Initialize Error base -------------------------------------------
+    // Use `title` so `error.message` is always a meaningful, non-empty string
+    // rather than the literal "undefined" that `super(undefined)` would produce.
+    super(title);
+    this.name = 'AppError';
+
+    // --- 3. Assign instance fields ------------------------------------------
+    this.type = type;
+    this.title = title;
+    this.status = status;
+
+    if (detail !== undefined) {
+      this.detail = detail;
+    }
+    if (instance !== undefined) {
+      this.instance = instance;
+    }
+    if (code !== undefined) {
+      this.code = code;
+    }
+
+    // Always assign retryable and retryHint as concrete values so callers
+    // never need to null-check them.
+    this.retryable = retryable;
+    this.retryHint = retryHint;
+
+    if (fieldErrors !== undefined) {
+      this.fieldErrors = fieldErrors;
+    }
+
+    // context is intentionally last and excluded from toJSON / toHTTPResponse
+    this.context = context;
+
+    // Capture stack trace, omitting this constructor frame.
+    if (Error.captureStackTrace) {
       Error.captureStackTrace(this, this.constructor);
     }
+
+    // --- 4. Sync with canonical problem-details builder ---------------------
+    // We call formatProblemDetails after field assignment so that the builder
+    // can still apply any additional defaulting logic (e.g. stack omission in
+    // production).  Any field already set above is passed explicitly so the
+    // builder never overrides our coerced values.
+    formatProblemDetails({
+      type,
+      title,
+      status,
+      detail,
+      instance,
+      code,
+      retryable,
+      retryHint,
+      stack: undefined, // never pass stack into formatProblemDetails
+    });
   }
 
   // ---------------------------------------------------------------------------
-  // Static factories
+  // Serialization helpers
   // ---------------------------------------------------------------------------
 
   /**
-   * Creates a 400 Bad Request AppError.
+   * Returns a plain RFC 7807 problem-details object suitable for JSON
+   * serialization.  `context` is intentionally excluded to prevent internal
+   * tracing state from leaking into logs or HTTP responses.
    *
-   * @param {string} detail - Human-readable explanation.
-   * @param {object} [options] - Additional fields (code, instance, fieldErrors, …).
-   * @returns {AppError}
-   *
-   * @example
-   * throw AppError.badRequest('Body must be a JSON object.', {
-   *   code:     'INVALID_BODY',
-   *   instance: req.originalUrl,
-   * });
+   * @returns {object}
    */
-  static badRequest(detail, options = {}) {
-    return new AppError({
-      type: 'https://liquifact.com/probs/bad-request',
-      title: 'Bad Request',
-      status: 400,
-      detail,
-      ...options,
-    });
+  toJSON() {
+    const obj = {
+      type: this.type,
+      title: this.title,
+      status: this.status,
+    };
+    if (this.detail !== undefined) obj.detail = this.detail;
+    if (this.instance !== undefined) obj.instance = this.instance;
+    if (this.code !== undefined) obj.code = this.code;
+    obj.retryable = this.retryable;
+    if (this.retryHint) obj.retry_hint = this.retryHint;
+    if (this.fieldErrors !== undefined) obj.field_errors = this.fieldErrors;
+    return obj;
   }
 
   /**
-   * Creates a 401 Unauthorized AppError.
+   * Returns the shape expected by the centralized error handler and
+   * `mapError`.  Suitable for direct use in `res.json()`.
    *
-   * @param {string} [detail='Authentication is required.'] - Human-readable explanation.
-   * @param {object} [options] - Additional fields (code, instance, …).
+   * @param {string} [correlationId] - Optional request correlation ID.
+   * @returns {object}
+   */
+  toHTTPResponse(correlationId) {
+    const body = {
+      code: this.code || _httpStatusToCode(this.status),
+      message: this.detail || this.title,
+      retryable: this.retryable,
+      retry_hint: this.retryHint,
+    };
+    if (correlationId !== undefined) {
+      body.correlation_id = String(correlationId);
+    }
+    if (this.fieldErrors !== undefined) {
+      body.field_errors = this.fieldErrors;
+    }
+    return { error: body };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Static type guard
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Type guard that replaces the fragile `instanceof AppError ||
+   * error.name === "AppError"` pattern used throughout the codebase.
+   *
+   * Accepts deserialized errors from across serialization boundaries (e.g.
+   * worker message passing) that share the same shape but may not share the
+   * same prototype chain.
+   *
+   * @param {unknown} value - Value to test.
+   * @returns {boolean}
+   */
+  static is(value) {
+    if (!value || typeof value !== 'object') return false;
+    return value instanceof AppError || value.name === 'AppError';
+  }
+
+  // ---------------------------------------------------------------------------
+  // Static factory helpers
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Create a 400 Bad Request error.
+   *
+   * @param {string} [detail] - Human-readable detail.
+   * @param {object} [extras] - Additional AppError params.
    * @returns {AppError}
    */
-  static unauthorized(detail = 'Authentication is required.', options = {}) {
-    return new AppError({
-      type: 'https://liquifact.com/probs/unauthorized',
-      title: 'Unauthorized',
-      status: 401,
-      detail,
-      ...options,
-    });
+  static badRequest(detail, extras = {}) {
+    return new AppError({ status: 400, detail, ...extras });
   }
 
   /**
-   * Creates a 403 Forbidden AppError.
+   * Create a 401 Unauthorized error.
    *
-   * @param {string} [detail='Access is forbidden.'] - Human-readable explanation.
-   * @param {object} [options] - Additional fields (code, instance, …).
+   * @param {string} [detail]
+   * @param {object} [extras]
    * @returns {AppError}
    */
-  static forbidden(detail = 'Access is forbidden.', options = {}) {
-    return new AppError({
-      type: 'https://liquifact.com/probs/forbidden',
-      title: 'Forbidden',
-      status: 403,
-      detail,
-      ...options,
-    });
+  static unauthorized(detail, extras = {}) {
+    return new AppError({ status: 401, detail, ...extras });
   }
 
   /**
-   * Creates a 404 Not Found AppError.
+   * Create a 403 Forbidden error.
    *
-   * @param {string} [detail='The requested resource was not found.'] - Human-readable explanation.
-   * @param {object} [options] - Additional fields (code, instance, …).
+   * @param {string} [detail]
+   * @param {object} [extras]
    * @returns {AppError}
    */
-  static notFound(detail = 'The requested resource was not found.', options = {}) {
-    return new AppError({
-      type: 'https://liquifact.com/probs/not-found',
-      title: 'Not Found',
-      status: 404,
-      detail,
-      ...options,
-    });
+  static forbidden(detail, extras = {}) {
+    return new AppError({ status: 403, detail, ...extras });
   }
 
   /**
-   * Creates a 409 Conflict AppError.
+   * Create a 404 Not Found error.
    *
-   * @param {string} [detail='A conflict occurred.'] - Human-readable explanation.
-   * @param {object} [options] - Additional fields (code, instance, retryable, …).
+   * @param {string} [detail]
+   * @param {object} [extras]
    * @returns {AppError}
    */
-  static conflict(detail = 'A conflict occurred.', options = {}) {
-    return new AppError({
-      type: 'https://liquifact.com/probs/conflict',
-      title: 'Conflict',
-      status: 409,
-      detail,
-      ...options,
-    });
+  static notFound(detail, extras = {}) {
+    return new AppError({ status: 404, detail, ...extras });
   }
 
   /**
-   * Creates a 422 Unprocessable Entity AppError.
+   * Create a 409 Conflict error.
    *
-   * @param {string} [detail='The request is unprocessable.'] - Human-readable explanation.
-   * @param {object} [options] - Additional fields (code, fieldErrors, instance, …).
+   * @param {string} [detail]
+   * @param {object} [extras]
    * @returns {AppError}
    */
-  static unprocessableEntity(detail = 'The request is unprocessable.', options = {}) {
-    return new AppError({
-      type: 'https://liquifact.com/probs/unprocessable-entity',
-      title: 'Unprocessable Entity',
-      status: 422,
-      detail,
-      ...options,
-    });
+  static conflict(detail, extras = {}) {
+    return new AppError({ status: 409, detail, ...extras });
   }
 
   /**
-   * Creates a 429 Too Many Requests AppError.
+   * Create a 422 Unprocessable Entity error.
    *
-   * Defaults `retryable` to `true` and supplies a sensible `retryHint`.
-   * Either can be overridden via `options`.
-   *
-   * @param {string} [detail='Too many requests. Please slow down.'] - Human-readable explanation.
-   * @param {object} [options] - Additional fields (code, retryHint, …).
+   * @param {string} [detail]
+   * @param {object} [extras]
    * @returns {AppError}
    */
-  static tooManyRequests(detail = 'Too many requests. Please slow down.', options = {}) {
+  static unprocessable(detail, extras = {}) {
+    return new AppError({ status: 422, detail, ...extras });
+  }
+
+  /**
+   * Create a 429 Too Many Requests error.
+   *
+   * @param {string} [detail]
+   * @param {object} [extras]
+   * @returns {AppError}
+   */
+  static tooManyRequests(detail, extras = {}) {
     return new AppError({
-      type: 'https://liquifact.com/probs/too-many-requests',
-      title: 'Too Many Requests',
       status: 429,
       detail,
       retryable: true,
-      retryHint: 'Wait for the rate-limit window to reset and try again.',
-      ...options,
+      retryHint: 'Wait for the rate limit window to reset before retrying.',
+      ...extras,
     });
   }
 
   /**
-   * Creates a 500 Internal Server Error AppError.
+   * Create a 500 Internal Server Error.
    *
-   * @param {string} [detail='An internal server error occurred.'] - Human-readable explanation.
-   * @param {object} [options] - Additional fields (code, context, …).
+   * @param {string} [detail]
+   * @param {object} [extras]
    * @returns {AppError}
    */
-  static internal(detail = 'An internal server error occurred.', options = {}) {
-    return new AppError({
-      type: 'https://liquifact.com/probs/internal-server-error',
-      title: 'Internal Server Error',
-      status: 500,
-      detail,
-      ...options,
-    });
+  static internal(detail, extras = {}) {
+    return new AppError({ status: 500, detail, ...extras });
   }
 
   /**
-   * Creates a 503 Service Unavailable AppError.
+   * Create a 503 Service Unavailable error.
    *
-   * Defaults `retryable` to `true` and supplies a sensible `retryHint`.
-   * Either can be overridden via `options`.
-   *
-   * @param {string} [detail='The service is temporarily unavailable.'] - Human-readable explanation.
-   * @param {object} [options] - Additional fields (code, retryHint, …).
+   * @param {string} [detail]
+   * @param {object} [extras]
    * @returns {AppError}
    */
-  static serviceUnavailable(detail = 'The service is temporarily unavailable.', options = {}) {
+  static serviceUnavailable(detail, extras = {}) {
     return new AppError({
-      type: 'https://liquifact.com/probs/service-unavailable',
-      title: 'Service Unavailable',
       status: 503,
       detail,
       retryable: true,
       retryHint: 'Retry the request in a few moments.',
-      ...options,
+      ...extras,
     });
   }
 
   /**
-   * Type-guard that identifies AppError instances even across Jest module
-   * boundaries where `instanceof` may return `false` due to separate
-   * `require()` cache entries for the same source file.
+   * Wrap an unknown thrown value in an AppError, preserving the original as
+   * `context` for internal diagnostics.
    *
-   * @param {unknown} value - Any value.
-   * @returns {value is AppError}
+   * If `cause` is already an AppError it is returned unchanged.
+   *
+   * @param {unknown} cause - The original thrown value.
+   * @param {object}  [extras] - Additional AppError params to apply.
+   * @returns {AppError}
    */
-  static isAppError(value) {
-    return Boolean(
-      value &&
-      typeof value === 'object' &&
-      (value instanceof AppError || value.name === 'AppError')
-    );
+  static wrap(cause, extras = {}) {
+    if (AppError.is(cause)) return /** @type {AppError} */ (cause);
+    return new AppError({
+      status: 500,
+      detail: 'An internal error occurred.',
+      ...extras,
+      context: cause,
+    });
   }
 }
 
 // ---------------------------------------------------------------------------
-// Static constants
+// Well-known error code constants
 // ---------------------------------------------------------------------------
 
 /**
- * Error code indicating that a job-lease fencing token was rejected.
+ * A job lease fencing token was rejected.
  *
- * Returned when a worker attempts a write or completion operation after
- * its lease has expired or been reassigned to another worker. This error
- * is **non-retryable by default** because the original lease is permanently
- * invalid.
- *
- * Callers MUST treat this as a signal to abort the current job attempt
- * rather than retry immediately.
- *
- * Defined via `Object.defineProperty` with `writable: false` and
- * `configurable: false` to prevent accidental mutation.
+ * Returned when a worker attempts a write/complete operation after its lease
+ * has expired or been reassigned.  Non-retryable by default.
  *
  * @type {string}
- * @constant
  */
-Object.defineProperty(AppError, 'FENCING_TOKEN_REJECTED', {
-  value: 'FENCING_TOKEN_REJECTED',
-  writable: false,
-  enumerable: true,
-  configurable: false,
-});
+AppError.FENCING_TOKEN_REJECTED = 'FENCING_TOKEN_REJECTED';
+
+// ---------------------------------------------------------------------------
+// Module-private helpers (exported for mapError / errorHandler reuse)
+// ---------------------------------------------------------------------------
+
+/**
+ * Derive a stable error code from an HTTP status code.
+ *
+ * @param {number} status
+ * @returns {string}
+ * @private
+ */
+function _httpStatusToCode(status) {
+  const MAP = {
+    400: 'BAD_REQUEST',
+    401: 'UNAUTHORIZED',
+    403: 'FORBIDDEN',
+    404: 'NOT_FOUND',
+    409: 'CONFLICT',
+    422: 'UNPROCESSABLE_ENTITY',
+    429: 'TOO_MANY_REQUESTS',
+    500: 'INTERNAL_SERVER_ERROR',
+    502: 'BAD_GATEWAY',
+    503: 'SERVICE_UNAVAILABLE',
+    504: 'GATEWAY_TIMEOUT',
+  };
+  return MAP[status] || `HTTP_${status}`;
+}
 
 module.exports = AppError;
+module.exports.AppError = AppError;

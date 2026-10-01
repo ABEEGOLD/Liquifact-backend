@@ -128,6 +128,7 @@ function errorHandler(error, req, res, _next) {
       correlation_id: correlationId,
       retryable: mapped.retryable,
       retry_hint: mapped.retryHint,
+      ...(Array.isArray(mapped.fieldErrors) && { field_errors: mapped.fieldErrors }),
     },
   });
 }

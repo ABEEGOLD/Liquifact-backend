@@ -243,31 +243,26 @@ function isAppErrorLike(error) {
  *   produce a deterministic 500 response without leaking the value.
  *
  * @param {unknown} error Thrown error value.
- * @returns {{status: number, code: string, message: string, retryable: boolean, retryHint: string}}
+ * @returns {{status: number, code: string, message: string, retryable: boolean, retryHint: string, fieldErrors?: Array}}
  */
 function mapError(error) {
-  if (isAppErrorLike(error)) {
-    const status = normalizeStatus(error.status);
-    const code = normalizeCode(error.code, httpStatusToCode(status));
-    const message = normalizeString(
-      error.detail,
-      MAX_MESSAGE_LENGTH,
-      normalizeString(
-        error.message,
-        MAX_MESSAGE_LENGTH,
-        httpStatusToCode(status),
-      ),
-    );
-    const retryable = normalizeRetryable(
-      error.retryable,
-      RETRYABLE_STATUSES.includes(status),
-    );
-    const retryHint = normalizeString(
-      error.retryHint,
-      MAX_RETRY_HINT_LENGTH,
-      defaultRetryHint(status),
-    );
-    return { status, code, message, retryable, retryHint };
+  // Use the canonical type guard instead of fragile instanceof + name checks.
+  if (AppError.is(error)) {
+    const mapped = {
+      status: error.status,
+      code: error.code || httpStatusToCode(error.status),
+      message: error.detail || error.message,
+      // AppError guarantees retryable is always a boolean; keep ?? for safety
+      // against deserialized cross-boundary errors that lost their prototype.
+      retryable: error.retryable ?? false,
+      retryHint: error.retryHint ?? "",
+    };
+    // Surface field-level validation errors when present so the error handler
+    // can include them in the response body without additional duck-typing.
+    if (Array.isArray(error.fieldErrors)) {
+      mapped.fieldErrors = error.fieldErrors;
+    }
+    return mapped;
   }
 
   if (isPlainObject(error) && error.isCorsOriginRejected === true) {
