@@ -22,6 +22,11 @@ jest.mock('../../src/metrics', () => {
     footprintCacheHitsTotal: makeCounter(),
     footprintCacheMissesTotal: makeCounter(),
     footprintCacheEvictionsTotal: makeCounter(),
+    // CORS origin-cache counters used by config/corsCache in CORS policy tests.
+    corsCacheHitsTotal: makeCounter(),
+    corsCacheMissesTotal: makeCounter(),
+    corsCacheEvictionsTotal: makeCounter(),
+    corsCacheInvalidationsTotal: makeCounter(),
 
     // API-key registry cache counters (issue #1266) — so apiKeysCache.js can
     // count hits/misses under test exactly as it does in production.
