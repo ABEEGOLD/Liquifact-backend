@@ -238,6 +238,99 @@ describe('LiquiFact API', () => {
 
       listenSpy.mockRestore();
     });
+
+    it('startServer - accepts port parameter override', () => {
+      const mockServer = { close: jest.fn() };
+      const listenSpy = jest.spyOn(app, 'listen').mockImplementation((port, cb) => {
+        if (cb) { cb(); }
+        return mockServer;
+      });
+
+      const server = startServer(8080);
+      expect(listenSpy).toHaveBeenCalledWith(8080);
+      expect(server).toBe(mockServer);
+
+      listenSpy.mockRestore();
+    });
+
+    it('startServer - uses PORT env var when no parameter provided', () => {
+      const originalPort = process.env.PORT;
+      process.env.PORT = '9999';
+      const mockServer = { close: jest.fn() };
+      const listenSpy = jest.spyOn(app, 'listen').mockImplementation((port, cb) => {
+        if (cb) { cb(); }
+        return mockServer;
+      });
+
+      const server = startServer();
+      expect(listenSpy).toHaveBeenCalledWith('9999');
+      expect(server).toBe(mockServer);
+
+      listenSpy.mockRestore();
+      process.env.PORT = originalPort;
+    });
+
+    it('startServer - defaults to 3001 when PORT env var not set', () => {
+      const originalPort = process.env.PORT;
+      delete process.env.PORT;
+      const mockServer = { close: jest.fn() };
+      const listenSpy = jest.spyOn(app, 'listen').mockImplementation((port, cb) => {
+        if (cb) { cb(); }
+        return mockServer;
+      });
+
+      const server = startServer();
+      expect(listenSpy).toHaveBeenCalledWith(3001);
+      expect(server).toBe(mockServer);
+
+      listenSpy.mockRestore();
+      process.env.PORT = originalPort;
+    });
+  });
+
+  describe('createApp compatibility', () => {
+    it('createApp - returns Express app instance', () => {
+      const testApp = createApp();
+      expect(typeof testApp).toBe('function');
+      expect(testApp.listen).toBeDefined();
+    });
+
+    it('createApp - forwards options to underlying factory', () => {
+      const testApp = createApp({ enableTestRoutes: true });
+      expect(typeof testApp).toBe('function');
+      expect(testApp.listen).toBeDefined();
+    });
+
+    it('createApp - handles undefined options gracefully', () => {
+      const testApp = createApp(undefined);
+      expect(typeof testApp).toBe('function');
+      expect(testApp.listen).toBeDefined();
+    });
+
+    it('createApp - handles null options gracefully', () => {
+      const testApp = createApp(null);
+      expect(typeof testApp).toBe('function');
+      expect(testApp.listen).toBeDefined();
+    });
+  });
+
+  describe('resetStore compatibility', () => {
+    it('resetStore - does not throw when cacheStore is unavailable', () => {
+      expect(() => resetStore()).not.toThrow();
+    });
+
+    it('resetStore - can be called multiple times safely', () => {
+      expect(() => {
+        resetStore();
+        resetStore();
+        resetStore();
+      }).not.toThrow();
+    });
+
+    it('resetStore - returns undefined', () => {
+      const result = resetStore();
+      expect(result).toBeUndefined();
+    });
   });
 });
 
