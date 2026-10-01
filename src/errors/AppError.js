@@ -102,6 +102,51 @@ function coerceString(raw, fallback) {
  */
 class AppError extends Error {
   /**
+   * Validates HTTP status code is within valid range.
+   *
+   * @param {unknown} status - Status code to validate.
+   * @throws {TypeError} If status is not a number or is out of valid range.
+   * @static
+   */
+  static _validateStatus(status) {
+    if (status !== undefined && status !== null) {
+      if (typeof status !== 'number') {
+        throw new TypeError(`AppError status must be a number, received: ${typeof status}`);
+      }
+      if (!Number.isInteger(status) || status < 100 || status > 599) {
+        throw new RangeError(`AppError status must be an integer between 100 and 599, received: ${status}`);
+      }
+    }
+  }
+
+  /**
+   * Validates type is a string when provided.
+   *
+   * @param {unknown} type - Type URI to validate.
+   * @throws {TypeError} If type is not a string when provided.
+   * @static
+   */
+  static _validateType(type) {
+    if (type !== undefined && type !== null && typeof type !== 'string') {
+      throw new TypeError(`AppError type must be a string, received: ${typeof type}`);
+    }
+  }
+
+  /**
+   * Validates retryable/retryHint consistency.
+   *
+   * @param {unknown} retryable - Retryable flag.
+   * @param {unknown} retryHint - Retry hint.
+   * @static
+   */
+  static _validateRetryConsistency(retryable, retryHint) {
+    if (retryable === true && !retryHint) {
+      // Log warning but don't throw - this is a soft invariant
+      console.warn('[AppError] retryable=true without retryHint is discouraged');
+    }
+  }
+
+  /**
    * Creates a new AppError instance.
    *
    * All fields have safe defaults; passing `null`, `undefined`, or a partial
