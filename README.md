@@ -424,21 +424,41 @@ STELLAR_NETWORK=TESTNET
 SOROBAN_RPC_URL=https://soroban-testnet.stellar.org
 ```
 
-Do NOT use custom RPC URLs. The validation will reject any deviation from the expected RPC for the selected network.
+Do NOT use custom RPC URLs. The validation will reject any deviation from the expected RPC for the selected network. A trailing slash and host casing are accepted; a path, query string, embedded credentials or an `http://` scheme are not, so a typo cannot downgrade RPC traffic to plaintext.
 
 ### Boot-time validation
 
 On startup, `src/index.js` calls `validateStellarConfig()` from `src/config/stellar.js`. If the network/RPC combination is invalid, the server fails to start with a clear error message:
 
 ```
-Error: Mismatch: STELLAR_NETWORK=TESTNET requires SOROBAN_RPC_URL="https://soroban-testnet.stellar.org", but got "https://custom-rpc.example.com". This combination would cause on-chain validation failures.
+Error: STELLAR_NETWORK=TESTNET requires SOROBAN_RPC_URL="https://soroban-testnet.stellar.org" (Mismatch).
 ```
+
+### Diagnosing a failure
+
+Every failure is a `StellarConfigError` carrying a stable, loggable `code` alongside the message. Branch on the code rather than on message text:
+
+| `error.code` | Meaning |
+| --- | --- |
+| `STELLAR_CONFIG_ENV_INVALID` | The environment map passed to `validateStellarConfig()` was not an object. |
+| `STELLAR_NETWORK_MISSING` | `STELLAR_NETWORK` unset, empty or whitespace-only. |
+| `SOROBAN_RPC_URL_MISSING` | `SOROBAN_RPC_URL` unset, empty or whitespace-only. |
+| `STELLAR_NETWORK_UNKNOWN` | `STELLAR_NETWORK` is not one of the three supported networks. |
+| `STELLAR_NETWORK_RPC_MISMATCH` | The RPC URL is not the canonical endpoint for the selected network. |
+| `STELLAR_CONFIG_NOT_VALIDATED` | `getStellarConfig()` was called before `validate()`. |
+| `STELLAR_PASSPHRASE_RPC_MISMATCH` | The validated store pairs a canonical passphrase with another network's canonical endpoint. |
+
+`error.details` holds the redacted diagnostic context and `error.toJSON()` is safe to log: URL credentials are replaced with `[redacted]@host`, control characters are stripped so a value cannot forge a log line, and echoed values are truncated at 200 characters.
+
+Validation is side-effect free and re-runnable — nothing is memoised and no shared state is written — so a rejected call can be corrected and retried in place, and the same environment always produces the same result. See [`docs/config.md`](./docs/config.md#3-configstellarjs--stellar-network-config) for the full invariant list.
 
 ### Security notes
 
 - The validation is a hard fail - no partial or degraded operation is permitted.
 - This ensures the backend never signs transactions with a mismatched network, which could result in fund loss.
 - The passphrase is derived from the network constant and is not user-configurable.
+- `getStellarConfig()` re-checks the passphrase/RPC pairing on every call, because `config/index` validates the two variables independently and would otherwise hand a mismatched pair to a signer.
+- Configuration errors never echo RPC URL credentials, so logs remain safe to ship.
 
 ---
 
@@ -669,6 +689,7 @@ Default port: `3001`.
 Escrow Redis cache is optional and disabled by default; set `REDIS_ESCROW_CACHE_ENABLED=true` with `REDIS_URL` to enable it.
 `REDIS_ESCROW_CACHE_TTL_SECONDS` is strictly clamped to `5..300`, and `REDIS_ESCROW_LEDGER_GAP_THRESHOLD` controls ledger-gap invalidation.
 `ESCROW_READ_PROJECTION_ENABLED` — feature flag that gates the projection/cache-based escrow read path (`getEscrowStateWithProjection`). When set to `false`, the service skips the Redis cache and `escrow_event_projection` table and reads directly from the Soroban contract (live read). Defaults to `true`.
+`CONFIG_RUNTIME_ENABLED` — feature flag that gates the `/api/admin/config` POST and GET `/sections` endpoints. When set to `false`, requests return `404` so the runtime config surface can be disabled without a deploy. Defaults to `true`.
 
 Incremental TypeScript setup and migration guidance lives in `docs/typescript-plan.md`.
 

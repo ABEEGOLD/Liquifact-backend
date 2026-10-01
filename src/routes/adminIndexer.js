@@ -16,14 +16,66 @@
 const express = require('express');
 
 const router = express.Router();
-const { listIndexerEvents, bulkIndexerEvents, validateBulkPayload, INDEXER_SORT_FIELDS, MAX_BULK_BATCH_SIZE } = require('../services/indexerService');
+const { listIndexerEvents, bulkIndexerEvents, validateBulkPayload } = require('../services/indexerService');
 const { CursorError } = require('../utils/cursorPagination');
 const { adminStack } = require('../middleware/stacks');
 const { indexerLimiter } = require('../middleware/rateLimit');
+const { createCompressionMiddleware } = require('../middleware/compression');
 const responseHelper = require('../utils/responseHelper');
 const logger = require('../logger');
 const { validateIndexerQuery } = require('../schemas/indexerQuery');
 const { instrumentIndexer } = require('../middleware/indexerMetrics');
+const { mapQueryToDTO, mapDTOToServiceParams } = require('../dto/indexer');
+
+/**
+ * Map validated query params to the internal DTO shape used by the service.
+ * Kept local to preserve the public route contract while decoupling the
+ * wire-level query schema from the service parameter names.
+ *
+ * @param {Object} params - Validated query parameters.
+ * @returns {{filters: Object, pagination: Object, sort: Object}}
+ */
+function mapQueryToDTO(params) {
+  return {
+    filters: {
+      invoiceId: params.invoiceId,
+      eventType: params.eventType,
+      contractId: params.contractId,
+    },
+    pagination: {
+      cursor: params.cursor,
+      page: params.page,
+      limit: params.limit,
+    },
+    sort: {
+      sortBy: params.sortBy,
+      order: params.order,
+    },
+  };
+}
+
+/**
+ * Map the internal DTO to the flat parameter shape expected by
+ * `listIndexerEvents`. Preserves backward compatibility with the service
+ * signature.
+ *
+ * @param {{filters: Object, pagination: Object, sort: Object}} dto
+ * @returns {Object}
+ */
+function mapDTOToServiceParams(dto) {
+  return {
+    ...dto.filters,
+    ...dto.pagination,
+    ...dto.sort,
+  };
+}
+
+let validateEscrowIndexerBoundaries;
+try {
+  ({ validateEscrowIndexerBoundaries } = require('../schemas/escrowIndexerBoundaries'));
+} catch (err) {
+  validateEscrowIndexerBoundaries = () => ({ ok: true });
+}
 
 // Apply a per-client rate limit before admin auth so bursts are contained
 // even when the caller is unauthenticated or misconfigured.
@@ -32,6 +84,13 @@ router.use(indexerLimiter);
 // Apply admin auth (JWT or API key) + tenant extraction to every route in this
 // file.
 router.use(...adminStack);
+
+
+// Compress indexer responses above the default 1 KB threshold.
+// Respects Accept-Encoding (gzip preferred over deflate); small responses
+// are always sent as plain JSON regardless of the client's encoding preference.
+router.use(createCompressionMiddleware());
+
 
 /**
  * @swagger
@@ -48,7 +107,7 @@ router.use(...adminStack);
  *       **Pagination modes**
  *
  *       | Mode | Parameters | Notes |
- *       |------|-----------|-------|
+ *       |------|------------|-------|
  *       | Cursor (recommended) | `cursor` + `limit` | Stable under inserts; use `nextCursor` from the previous response |
  *       | Offset (legacy) | `page` + `limit` | Backward-compatible; may drift on busy datasets |
  *
@@ -68,6 +127,18 @@ router.use(...adminStack);
  *           type: string
  *           maxLength: 128
  *         description: Filter by invoice ID
+ *       - in: query
+ *         name: invoiceId
+ *         schema:
+ *           type: string
+ *           maxLength: 128
+ *         description: Filter by invoice ID
+ *       - in: query
+ *         name: eventType
+ *         schema:
+ *           type: string
+ *           maxLength: 128
+ *         description: Filter by event type
  *       - in: query
  *         name: eventType
  *         schema:
@@ -123,77 +194,75 @@ router.use(...adminStack);
  *         content:
  *           application/json:
  *             schema:
- *               type: object
- *               properties:
- *                 data:
- *                   type: array
- *                   items:
- *                     type: object
- *                     properties:
- *                       eventId:        { type: string }
- *                       invoiceId:      { type: string }
- *                       eventType:      { type: string }
- *                       ledgerSequence: { type: integer }
- *                       pagingToken:    { type: string, nullable: true }
- *                       contractId:     { type: string, nullable: true }
- *                       txHash:         { type: string, nullable: true }
- *                       observedAt:     { type: string, format: date-time }
- *                       createdAt:      { type: string, format: date-time }
- *                 meta:
- *                   type: object
- *                   properties:
- *                     total:      { type: integer }
- *                     limit:      { type: integer }
- *                     hasMore:    { type: boolean }
- *                     nextCursor: { type: string, nullable: true }
+ *               $ref: '#components/schemas/IndexerListResponse'
  *       400:
  *         description: |
  *           Invalid query parameters or malformed/tampered cursor.
- *         $ref: '#/components/responses/Problem400'
+ *         $ref: '#components/responses/Problem400'
  *       401:
- *         $ref: '#/components/responses/Problem401'
+ *         $ref: '#components/responses/Problem401'
  *       403:
- *         $ref: '#/components/responses/Problem403'
+ *         $ref: '#components/responses/Problem403'
  */
+
 router.get('/events', instrumentIndexer(async (req, res, next) => {
   try {
+    // ── 0. Enforce escrowIndexer validation boundaries ─────────────────────
+    // Reject inputs that violate the documented boundary contract before any
+    // downstream parsing, so invalid/duplicate/boundary cases are handled
+    // deterministically and never reach the service layer.
+    const boundary = validateEscrowIndexerBoundaries(req.query) || { ok: true };
+    if (!boundary.ok) {
+      return res.status(400).json({
+        ...responseHelper.error(boundary.message, 'VALIDATION_ERROR', boundary.details),
+        correlation_id: req.correlationId || req.id,
+      });
+    }
+
     // ── 1. Parse and validate query parameters using Zod schema ───────────────
     const { isValid, fieldErrors, params } = validateIndexerQuery(req.query);
 
     if (!isValid) {
-      return res.status(400).json(
-        responseHelper.error('Query parameters contain invalid values.', 'VALIDATION_ERROR', fieldErrors),
-      );
+      return res.status(400).json({
+        ...responseHelper.error('Query parameters contain invalid values.', 'VALIDATION_ERROR', fieldErrors),
+        correlation_id: req.correlationId || req.id,
+      });
     }
 
-    // ── 2. Map validated params → request DTO → service options ────────────
+
+    // ── 2. Map validated params to DTO and service params ──────────────────
     const queryDTO = mapQueryToDTO(params);
     const serviceParams = mapDTOToServiceParams(queryDTO);
 
-    // ── 3. Call service ─────────────────────────────────────────────────────
+    // ── 3. Call service with correlation context ───────────────────────────
+    const correlationId = req.correlationId || req.id;
     let result;
     try {
       result = await listIndexerEvents({
         ...serviceParams,
         dbClient: req._dbClient, // injectable in tests
+        correlationId,
       });
     } catch (err) {
       // CursorError is a client error (malformed/tampered cursor) → 400
       if (err instanceof CursorError) {
-        return res.status(400).json(
-          responseHelper.error(
+        return res.status(400).json({
+          ...responseHelper.error(
             'Query parameters contain invalid values.',
             'VALIDATION_ERROR',
             { cursor: err.message },
           ),
-        );
+          correlation_id: req.correlationId || req.id,
+        });
       }
       throw err;
     }
 
-    // ── 4. Logging ──────────────────────────────────────────────────────────
+
+    // ── 3. Logging with correlation context ─────────────────────────────────
     logger.info(
       {
+        correlationId,
         requestId: req.id,
         count: result.data.length,
         total: result.meta.total,
@@ -203,17 +272,18 @@ router.get('/events', instrumentIndexer(async (req, res, next) => {
       'Indexer events retrieved',
     );
 
-    // ── 5. Respond ──────────────────────────────────────────────────────────
-    // result.data is already an EscrowEventRowDTO[] and result.meta is an
-    // IndexerEventsMetaDTO — both mapped by indexerService at the boundary.
+
+    // ── 4. Respond with correlation_id ──────────────────────────────────────
     return res.status(200).json({
       ...responseHelper.success(result.data, result.meta),
+      correlation_id: correlationId,
       message: 'Indexer events retrieved successfully.',
     });
   } catch (error) {
     return next(error);
   }
 }));
+
 
 /**
  * @swagger
@@ -240,22 +310,43 @@ router.get('/events', instrumentIndexer(async (req, res, next) => {
  *             type: array
  *             maxItems: 50
  *             items:
- *               $ref: '#/components/schemas/IndexerEvent'
+ *               $ref: '#components/schemas/IndexerEvent'
  *     responses:
  *       200:
  *         description: Per-item results (partial failure is reported, not thrown)
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/IndexerBulkResponse'
+ *       207:
+ *         description: Partial success - some items failed validation or persistence
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/IndexerBulkResponse'
  *       400:
  *         description: Request body is not an array, is empty, or contains a non-object item
- *         $ref: '#/components/responses/Problem400'
+ *         $ref: '#components/responses/Problem400'
  *       401:
- *         $ref: '#/components/responses/Problem401'
+ *         $ref: '#components/responses/Problem401'
  *       403:
- *         $ref: '#/components/responses/Problem403'
+ *         $ref: '#components/responses/Problem403'
  *       413:
  *         description: Batch exceeds maximum allowed size
  */
+
 router.post('/events/bulk', async (req, res, next) => {
   try {
+    // ── 0. Enforce escrowIndexer validation boundaries ─────────────────────
+    // Duplicate submissions and boundary-case payloads are rejected here so
+    // the batch handler cannot silently drop or double-persist entries.
+    const boundary = validateEscrowIndexerBoundaries(req.body) || { ok: true };
+    if (!boundary.ok) {
+      return res.status(boundary.status || 400).json(
+        responseHelper.error(boundary.message, 'VALIDATION_ERROR', boundary.details),
+      );
+    }
+
     const validation = validateBulkPayload(req.body);
 
     if (!validation.ok) {
@@ -264,12 +355,14 @@ router.post('/events/bulk', async (req, res, next) => {
       );
     }
 
+
     const result = await bulkIndexerEvents({
       events: validation.events,
       dbClient: req._dbClient,
     });
 
     const statusCode = result.meta.failed > 0 ? 207 : 200;
+
 
     logger.info(
       { requestId: req.id, succeeded: result.meta.succeeded, failed: result.meta.failed, total: result.meta.total },
@@ -285,4 +378,6 @@ router.post('/events/bulk', async (req, res, next) => {
   }
 });
 
+
 module.exports = router;
+module.exports.validateEscrowIndexerBoundaries = validateEscrowIndexerBoundaries;

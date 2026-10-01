@@ -30,12 +30,9 @@ const AppError = require('../../errors/AppError');
 const { invoiceCreateSchema, invoiceUpdateSchema, parseValidationErrors } = require('../../schemas/invoice');
 const { escrowBatchReadSchema } = require('../../schemas/escrowBatchRead');
 const { validatePatchFields, detectLockedFieldChange } = require('../../middleware/patchInvoice');
+const { InvoiceVersionError, conflictPayload, expectedVersionFromRequest } = require('../../services/invoiceConcurrency');
 const { validateHealthQuery, rejectBodyOnGet } = require('../../schemas/health');
-const { z } = require('zod');
-
-const validateEscrowReadParams = z.object({
-  invoiceId: z.string().min(1).max(64),
-});
+const { invoiceIdempotencyMiddleware } = require('../../middleware/invoiceIdempotency');
 
 // ── Sub-router mounts ────────────────────────────────────────────────────────
 router.use('/invest', investRoutes);
@@ -120,7 +117,7 @@ router.get('/invoices', extractTenant, async (req, res, next) => {
  * Response 201:
  *   { data: Invoice, message: string }
  */
-router.post('/invoices', extractTenant, async (req, res, next) => {
+router.post('/invoices', extractTenant, invoiceIdempotencyMiddleware(), async (req, res, next) => {
   try {
     // --- Zod validation -------------------------------------------------------
     const parsed = invoiceCreateSchema.safeParse(req.body);
@@ -146,6 +143,9 @@ router.post('/invoices', extractTenant, async (req, res, next) => {
 
     // Normalise buyer / customer: prefer `buyer`, fall back to `customer`
     const customerName = (body.buyer || body.customer || '').trim();
+    const invoiceReference = typeof body.invoiceNumber === 'string'
+      ? body.invoiceNumber.trim().toLowerCase()
+      : undefined;
 
     const invoice = await invoiceService.createInvoice(
       {
@@ -154,7 +154,7 @@ router.post('/invoices', extractTenant, async (req, res, next) => {
         currency: body.currency,
         dueDate: body.dueDate,
         description: body.description,
-        invoiceNumber: body.invoiceNumber,
+        invoiceNumber: invoiceReference,
       },
       req.tenantId,
     );
@@ -292,8 +292,24 @@ router.patch('/invoices/:id', extractTenant, validatePatchFields, async (req, re
       );
     }
 
-    const updates = parsed.data;
-    const updated = await invoiceService.updateInvoice(invoiceId, updates, req.tenantId);
+    let expectedVersion;
+    try {
+      expectedVersion = expectedVersionFromRequest(req.body, req.headers['if-match']);
+    } catch (versionError) {
+      if (versionError instanceof InvoiceVersionError) versionError.statusCode = 400;
+      return next(versionError);
+    }
+
+    const { version: _version, ...updates } = parsed.data;
+    let updated;
+    try {
+      updated = await invoiceService.updateInvoice(invoiceId, updates, req.tenantId, { expectedVersion });
+    } catch (versionError) {
+      if (versionError instanceof InvoiceVersionError) {
+        return res.status(versionError.statusCode).json(conflictPayload(versionError));
+      }
+      throw versionError;
+    }
 
     if (!updated) {
       return next(new AppError({ title: 'Not Found', status: 404, detail: 'Invoice not found' }));

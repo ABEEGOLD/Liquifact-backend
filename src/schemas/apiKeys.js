@@ -29,6 +29,8 @@ const {
   VALID_SCOPES,
 } = config;
 
+const KEY_STATUSES = ['active', 'retiring', 'revoked'];
+
 // ── Shared primitives ────────────────────────────────────────────────────────
 
 /**
@@ -79,7 +81,27 @@ const scopesSchema = z
   .refine(
     (scopes) => scopes.every((s) => VALID_SCOPES.includes(s)),
     { message: `scopes must only contain: ${VALID_SCOPES.join(', ')}` }
+  )
+  .refine(
+    (scopes) => new Set(scopes).size === scopes.length,
+    { message: 'scopes array must not contain duplicates' }
   );
+
+// ── Shared lifecycle schemas ──────────────────────────────────────────────────
+
+/**
+ * Validates key lifecycle status.
+ */
+const statusSchema = z.enum(KEY_STATUSES, {
+  invalid_type_error: `status must be one of: ${KEY_STATUSES.join(', ')}`,
+});
+
+/**
+ * Validates ISO 8601 date-time strings for key activation/expiry.
+ */
+const dateSchema = z
+  .string({ invalid_type_error: 'must be a string' })
+  .datetime({ offset: true, message: 'must be a valid ISO 8601 date-time' });
 
 // ── Create schema ────────────────────────────────────────────────────────────
 
@@ -110,6 +132,15 @@ const apiKeyCreateSchema = z
     revoked: z
       .boolean({ invalid_type_error: 'revoked must be a boolean' })
       .optional(),
+
+    /** Lifecycle status of the key. Optional; defaults to 'active'. */
+    status: statusSchema.optional(),
+
+    /** ISO timestamp when the key becomes active. Optional. */
+    activatedAt: dateSchema.optional(),
+
+    /** ISO timestamp when the key expires. Optional. */
+    expiresAt: dateSchema.optional(),
   })
   .strict();
 
@@ -132,6 +163,15 @@ const apiKeyUpdateSchema = z
     revoked: z
       .boolean({ invalid_type_error: 'revoked must be a boolean' })
       .optional(),
+
+    /** Lifecycle status of the key. Optional; defaults to 'active'. */
+    status: statusSchema.optional(),
+
+    /** ISO timestamp when the key becomes active. Optional. */
+    activatedAt: dateSchema.optional(),
+
+    /** ISO timestamp when the key expires. Optional. */
+    expiresAt: dateSchema.optional(),
   })
   .strict();
 

@@ -6,17 +6,17 @@
  * data leakage.  Soft-deletes are implemented via the `deleted_at` column.
  *
  * Public API (DB-backed):
- *   listInvoices(tenantId, opts)          � list with soft-delete filter
- *   getInvoices(queryParams | tenantId)   � legacy dual-arity shim kept for
+ *   listInvoices(tenantId, opts)          — list with soft-delete filter
+ *   getInvoices(queryParams | tenantId)   — legacy dual-arity shim kept for
  *                                           backward-compat with existing routes
- *   getInvoiceById(id, tenantId)          — single record, tenant-scoped
- *   createInvoice(data, tenantId)          — insert with generated invoice_id
- *   updateInvoice(id, updates, tenantId)  — tenant-scoped UPDATE
- *   deleteInvoice(id, tenantId)           — soft-delete
- *   resolveInvoiceForTenant(id, tenantId) — tenant-scoped lookup for state routes
- *   transitionInvoice(id, target, tenantId, opts) — execute + persist transition
+ *   getInvoiceById(id, tenantId)          â€” single record, tenant-scoped
+ *   createInvoice(data, tenantId)          â€” insert with generated invoice_id
+ *   updateInvoice(id, updates, tenantId)  â€” tenant-scoped UPDATE
+ *   deleteInvoice(id, tenantId)           â€” soft-delete
+ *   resolveInvoiceForTenant(id, tenantId) â€” tenant-scoped lookup for state routes
+ *   transitionInvoice(id, target, tenantId, opts) â€” execute + persist transition
  *
- * KYC helpers (in-memory mockInvoices � retained for test compatibility):
+ * KYC helpers (in-memory mockInvoices — retained for test compatibility):
  *   getInvoicesByKycStatus(userId, kycStatus)
  *   updateInvoiceKycStatus(invoiceId, newKycStatus, kycRecordId)
  *
@@ -28,10 +28,22 @@ const { getMetricsCacheStore } = require('./metricsCacheStore');
 const db = require('../db/knex');
 const { applyQueryOptions } = require('../utils/queryBuilder');
 const { encodeCursor, decodeCursor, CursorError } = require('../utils/cursorPagination');
+const {
+  normalizeInvoicePageSize,
+  resolveInvoiceSort,
+  encodeInvoiceCursor,
+  decodeInvoiceCursor,
+} = require('../utils/invoicePagination');
 const logger = require('../logger');
 const AppError = require('../errors/AppError');
 const { LOCKED_STATUSES } = require('../middleware/patchInvoice');
 const { executeTransition, validateTransition } = require('./invoiceStateMachine');
+const {
+  InvoiceVersionConflictError,
+  normalizeInvoiceVersion,
+  requireStoredVersion,
+} = require('./invoiceConcurrency');
+const { insertOutboxEvent } = require('./webhookOutbox');
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -136,8 +148,8 @@ async function listInvoices(tenantId, opts = {}) {
  * Dual-arity shim kept for backward compatibility with existing callers and
  * tests that use either call form:
  *
- *   getInvoices(queryParams)          � object arg (legacy /api/invoices route)
- *   getInvoices(tenantId, status)     � positional args (older service callers)
+ *   getInvoices(queryParams)          — object arg (legacy /api/invoices route)
+ *   getInvoices(tenantId, status)     — positional args (older service callers)
  *
  * @param {object|string} arg1 - Either a query-params object or a tenant ID string.
  * @param {string} [arg2]      - Optional status filter (only when arg1 is a tenant ID).
@@ -145,7 +157,7 @@ async function listInvoices(tenantId, opts = {}) {
  */
 async function getInvoices(arg1 = {}, arg2) {
   if (arg1 && typeof arg1 === 'object') {
-    // Query-params style � used by old /api/invoices GET handler
+    // Query-params style — used by old /api/invoices GET handler
     try {
       let query = db('invoices').select('*');
       query = applyQueryOptions(query, arg1, INVOICE_QUERY_CONFIG);
@@ -156,7 +168,7 @@ async function getInvoices(arg1 = {}, arg2) {
     }
   }
 
-  // Positional args style � (tenantId, status)
+  // Positional args style — (tenantId, status)
   const tenantId = arg1;
   if (!tenantId) {
     throw new TypeError('tenantId is required');
@@ -195,7 +207,7 @@ function _applyInvoiceFilters(query, filters) {
  *
  * Cursor mode uses keyset pagination over `(sortField, id)`, returning a stable
  * `nextCursor` that works correctly under concurrent inserts.  The cursor is
- * opaque and HMAC-signed � tampering yields a {@link CursorError}.
+ * opaque and HMAC-signed — tampering yields a {@link CursorError}.
  *
  * Offset mode accepts `page` (1-based) and `limit` for backward compat.
  * Both modes return the same `{ data, meta }` shape.
@@ -208,11 +220,11 @@ function _applyInvoiceFilters(query, filters) {
  * @throws {CursorError} When the cursor is malformed, tampered, or has a sort-field mismatch.
  */
 async function getInvoicesWithPagination({ filters = {}, sorting = {}, pagination = {} } = {}) {
-  const limit = Math.max(1, Math.min(100, parseInt(pagination.limit, 10) || 10));
-  const sortField = (sorting.sortBy && INVOICE_PAGINATION_COLUMN_MAP[sorting.sortBy])
-    ? sorting.sortBy
-    : 'created_at';
-  const order = (sorting.order === 'asc') ? 'asc' : 'desc';
+  const limit = normalizeInvoicePageSize(pagination.limit);
+  const resolvedSort = resolveInvoiceSort(sorting.sortBy, sorting.order);
+  const sortField = resolvedSort.alias;
+  const sortColumn = resolvedSort.column;
+  const order = resolvedSort.order;
 
   // -- Base query (exclude soft-deleted records) -----------------------------
   const baseQuery = () => db('invoices').whereNull('deleted_at');
@@ -220,14 +232,15 @@ async function getInvoicesWithPagination({ filters = {}, sorting = {}, paginatio
   // -- Total count (filter-aware, offset-independent) ------------------------
   let countQ = baseQuery();
   _applyInvoiceFilters(countQ, filters);
-  const countRow = await countQ.count('* as total').first();
+  const countResult = await countQ.count('* as total');
+  const countRow = Array.isArray(countResult) ? (countResult[0] || {}) : (countResult || {});
   const total = parseInt(countRow.total ?? countRow['count(*)'] ?? 0, 10);
 
   const useCursor = Boolean(pagination.cursor);
 
   // -- Cursor-based keyset pagination ----------------------------------------
   if (useCursor) {
-    const decoded = decodeCursor(pagination.cursor, sortField);
+    const decoded = decodeInvoiceCursor(pagination.cursor, sortField);
     const { sortValue, id: lastId } = decoded;
 
     let dataQ = baseQuery().select('*');
@@ -238,13 +251,13 @@ async function getInvoicesWithPagination({ filters = {}, sorting = {}, paginatio
     //   DESC: (sortField < lastValue) OR (sortField = lastValue AND id < lastId)
     const gtOp = order === 'asc' ? '>' : '<';
     dataQ.where(function () {
-      this.where(sortField, gtOp, sortValue)
+      this.where(sortColumn, gtOp, sortValue)
         .orWhere(function () {
-          this.where(sortField, '=', sortValue).where('id', gtOp, lastId);
+          this.where(sortColumn, '=', sortValue).where('id', gtOp, lastId);
         });
     });
 
-    dataQ.orderBy(sortField, order).orderBy('id', order);
+    dataQ.orderBy(sortColumn, order).orderBy('id', order);
 
     const rows = await dataQ.limit(limit + 1);
     const hasMore = rows.length > limit;
@@ -253,11 +266,7 @@ async function getInvoicesWithPagination({ filters = {}, sorting = {}, paginatio
     let nextCursor = null;
     if (hasMore && data.length > 0) {
       const lastRow = data[data.length - 1];
-      nextCursor = encodeCursor({
-        sortField,
-        sortValue: lastRow[sortField],
-        id: lastRow.id,
-      });
+      nextCursor = encodeInvoiceCursor(lastRow, sortField);
     }
 
     return { data, meta: { total, limit, hasMore, nextCursor } };
@@ -269,7 +278,7 @@ async function getInvoicesWithPagination({ filters = {}, sorting = {}, paginatio
 
   let dataQ = baseQuery().select('*');
   _applyInvoiceFilters(dataQ, filters);
-  dataQ.orderBy(sortField, order).orderBy('id', order);
+  dataQ.orderBy(sortColumn, order).orderBy('id', order);
 
   const pagedRows = await dataQ.limit(limit + 1).offset(offset);
   const pagedHasMore = pagedRows.length > limit;
@@ -278,11 +287,7 @@ async function getInvoicesWithPagination({ filters = {}, sorting = {}, paginatio
   let pagedNextCursor = null;
   if (pagedHasMore && pagedData.length > 0) {
     const lastRow = pagedData[pagedData.length - 1];
-    pagedNextCursor = encodeCursor({
-      sortField,
-      sortValue: lastRow[sortField],
-      id: lastRow.id,
-    });
+    pagedNextCursor = encodeInvoiceCursor(lastRow, sortField);
   }
 
   return {
@@ -317,7 +322,7 @@ async function getInvoiceById(id, tenantId) {
     .whereNull('deleted_at')
     .first();
 
-  return invoice || null;
+  return invoice ? normalizeInvoiceVersion(invoice) : null;
 }
 
 /**
@@ -355,9 +360,30 @@ async function createInvoice(invoiceData, tenantId) {
     metadata,
   } = invoiceData || {};
 
-  const invoiceId =
-    invoiceNumber ||
-    `inv_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+  const normalizedReference = typeof invoiceNumber === 'string'
+    ? invoiceNumber.trim().toLowerCase()
+    : undefined;
+
+  if (normalizedReference) {
+    const existing = await db('invoices')
+      .where({ tenant_id: tenantId })
+      .whereRaw('LOWER(COALESCE(invoice_number, ?)) = ?', ['', normalizedReference])
+      .first();
+
+    if (existing) {
+      throw new AppError({
+        type: 'https://liquifact.com/probs/conflict',
+        title: 'Conflict',
+        status: 409,
+        detail: 'Invoice reference already exists for this tenant.',
+        instance: '/v1/invoices',
+        code: 'INVOICE_REFERENCE_CONFLICT',
+        retryable: false,
+      });
+    }
+  }
+
+  const invoiceId = `inv_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
 
   const row = {
     invoice_id: invoiceId,
@@ -365,6 +391,7 @@ async function createInvoice(invoiceData, tenantId) {
     customer,
     status,
     tenant_id: tenantId,
+    ...(normalizedReference ? { invoice_number: normalizedReference } : {}),
     ...(currency !== undefined && { currency }),
     ...(dueDate !== undefined && { due_date: dueDate }),
     ...(description !== undefined && { description }),
@@ -373,16 +400,38 @@ async function createInvoice(invoiceData, tenantId) {
 
   // SQLite returns an array of primary-key integers from insert(); PostgreSQL
   // returns full rows when `.returning('*')` is chained. We normalise both.
-  const result = await db('invoices').insert(row).returning('*');
-  getMetricsCacheStore().invalidatePrefix('marketplace:'); 
-  if (Array.isArray(result) && result.length > 0 && typeof result[0] === 'object') {
-    // PostgreSQL path � full row returned
-    return result[0];
-  }
+  try {
+    const result = await db('invoices').insert(row).returning('*');
+    getMetricsCacheStore().invalidatePrefix('marketplace:');
+    if (Array.isArray(result) && result.length > 0 && typeof result[0] === 'object') {
+      // PostgreSQL path — full row returned
+      return result[0];
+    }
 
-  // SQLite path � result is an array of inserted PKs; refetch by invoice_id
-  const inserted = await db('invoices').where({ invoice_id: invoiceId }).first();
-  return inserted;
+    // SQLite path — result is an array of inserted PKs; refetch by invoice_id
+    const inserted = await db('invoices').where({ invoice_id: invoiceId }).first();
+    return inserted;
+  } catch (err) {
+    const uniqueViolation = err && (
+      err.code === 'SQLITE_CONSTRAINT' ||
+      err.code === '23505' ||
+      /duplicate key|unique constraint|UNIQUE constraint/i.test(String(err.message || ''))
+    );
+
+    if (uniqueViolation) {
+      throw new AppError({
+        type: 'https://liquifact.com/probs/conflict',
+        title: 'Conflict',
+        status: 409,
+        detail: 'Invoice reference already exists for this tenant.',
+        instance: '/v1/invoices',
+        code: 'INVOICE_REFERENCE_CONFLICT',
+        retryable: false,
+      });
+    }
+
+    throw err;
+  }
 }
 
 /**
@@ -408,18 +457,26 @@ async function createInvoice(invoiceData, tenantId) {
  * @param {string} tenantId - Tenant identifier.
  * @param {object} [options={}] - Update options.
  * @param {string} [options.expectedStatus] - Required current status for CAS.
+ * @param {number} [options.expectedVersion] - Required current OCC revision.
  * @returns {Promise<object|null>} Updated row, or null when missing / CAS miss.
  */
 async function updateInvoice(id, updates = {}, tenantId, options = {}) {
   if (!id) {
     throw new TypeError('invoice id required');
   }
-  const { expectedStatus } = options;
+  const { expectedStatus, expectedVersion } = options;
 
   // Ensure invoice exists and belongs to tenant
   const existing = await db('invoices').where({ invoice_id: id, tenant_id: tenantId }).first();
   if (!existing) {
     return null;
+  }
+
+  const currentVersion = expectedVersion === undefined
+    ? undefined
+    : requireStoredVersion(existing);
+  if (expectedVersion !== undefined && currentVersion !== expectedVersion) {
+    throw new InvoiceVersionConflictError(expectedVersion, currentVersion);
   }
 
   // CAS pre-check (still enforced atomically in the UPDATE below)
@@ -442,33 +499,57 @@ async function updateInvoice(id, updates = {}, tenantId, options = {}) {
   if (expectedStatus !== undefined) {
     where.status = expectedStatus;
   }
+  if (expectedVersion !== undefined) {
+    where.version = expectedVersion;
+  }
+
+  const versionUpdate = expectedVersion === undefined ? {} : { version: expectedVersion + 1 };
 
   const result = await db('invoices')
     .where(where)
-    .update({ ...updates, updated_at: nowValue() })
+    .update({ ...updates, ...versionUpdate, updated_at: nowValue() })
     .returning('*');
 
   getMetricsCacheStore().invalidatePrefix('marketplace:');
 
   if (Array.isArray(result) && result.length > 0 && typeof result[0] === 'object') {
-    return result[0];
+    return normalizeInvoiceVersion(result[0]);
   }
 
   // SQLite / drivers that return affected-row count instead of returning(*)
   if (typeof result === 'number') {
     if (result === 0) {
+      if (expectedVersion !== undefined) {
+        const latest = await db('invoices')
+          .where({ invoice_id: id, tenant_id: tenantId })
+          .first();
+        if (latest) {
+          throw new InvoiceVersionConflictError(expectedVersion, requireStoredVersion(latest));
+        }
+      }
       return null;
     }
-    return db('invoices').where({ invoice_id: id, tenant_id: tenantId }).first();
+    const updated = await db('invoices').where({ invoice_id: id, tenant_id: tenantId }).first();
+    return normalizeInvoiceVersion(updated);
   }
 
-  if (expectedStatus !== undefined) {
-    // Empty returning array ⇒ CAS miss under Postgres
+  if (expectedStatus !== undefined || expectedVersion !== undefined) {
+    // Empty returning array â‡’ CAS miss under Postgres
+    if (expectedVersion !== undefined) {
+      const latest = await db('invoices')
+        .where({ invoice_id: id, tenant_id: tenantId })
+        .first();
+      if (latest) {
+        throw new InvoiceVersionConflictError(expectedVersion, requireStoredVersion(latest));
+      }
+    }
     return null;
   }
 
   // SQLite path (non-CAS)
-  return db('invoices').where({ invoice_id: id, tenant_id: tenantId }).first();
+  return normalizeInvoiceVersion(
+    await db('invoices').where({ invoice_id: id, tenant_id: tenantId }).first(),
+  );
 }
 
 /**
@@ -514,7 +595,7 @@ async function deleteInvoice(id, tenantId) {
     return result[0];
   }
 
-  // SQLite path � refetch after update
+  // SQLite path — refetch after update
   return db('invoices').where({ invoice_id: id, tenant_id: tenantId }).first();
 }
 
@@ -541,7 +622,7 @@ function parseInvoiceMetadata(raw) {
 /**
  * Resolves an invoice for the authenticated tenant.
  * Returns null when the invoice does not exist, is soft-deleted, or belongs to
- * another tenant � callers should respond with 404 without leaking existence.
+ * another tenant — callers should respond with 404 without leaking existence.
  *
  * @param {string} invoiceId - Public invoice_id (e.g. "inv-001").
  * @param {string} tenantId  - Tenant identifier from extractTenant middleware.
@@ -558,7 +639,7 @@ async function resolveInvoiceForTenant(invoiceId, tenantId) {
 /**
  * Executes a validated state transition via the invoice state machine and
  * persists the resulting status to the database. Status is always derived from
- * the state machine result � client-supplied status fields are never written.
+ * the state machine result — client-supplied status fields are never written.
  *
  * Optionally merges `escrowId` into the invoice metadata when linking escrow.
  *
@@ -572,7 +653,7 @@ async function resolveInvoiceForTenant(invoiceId, tenantId) {
  * @param {string} [options.userAgent] - Request user agent.
  * @param {object} [options.metadata] - Additional audit metadata.
  * @param {string|null|undefined} [options.escrowId] - Escrow contract ID to persist in metadata.
- * @returns {Promise<object>} State-machine transition result (previousState, newState, auditLog, �).
+ * @returns {Promise<object>} State-machine transition result (previousState, newState, auditLog, …).
  * @throws {Error} With `.code` / `.allowedTransitions` when validation fails.
  * @throws {Error} With `.code = 'INVOICE_NOT_FOUND'` and `.statusCode = 404` when not found.
  */
@@ -619,44 +700,78 @@ async function transitionInvoice(invoiceId, targetState, tenantId, options = {})
     updates.metadata = JSON.stringify(meta);
   }
 
-  // Optimistic CAS: only persist when status is still the state we validated against.
-  const persisted = await module.exports.updateInvoice(invoiceId, updates, tenantId, {
-    expectedStatus: invoice.status,
-  });
+  // Transactional outbox: atomically commit the invoice mutation and the
+  // webhook outbox event so downstream projections can never become stale.
+  const outboxEvent = `invoice.${invoice.status}_to_${targetState}`;
+  const correlationId = require('../requestContext').getContext().correlationId || null;
 
-  if (!persisted) {
-    const latest = await module.exports.resolveInvoiceForTenant(invoiceId, tenantId);
-    if (!latest) {
-      const err = new Error('Invoice not found');
-      err.code = 'INVOICE_NOT_FOUND';
-      err.statusCode = 404;
+  await db.transaction(async (trx) => {
+    // Optimistic CAS inside the transaction
+    const where = { invoice_id: invoiceId, tenant_id: tenantId, status: invoice.status };
+    if (invoice.version !== undefined) {
+      where.version = requireStoredVersion(invoice);
+    }
+
+    const versionUpdate = invoice.version === undefined ? {} : { version: requireStoredVersion(invoice) + 1 };
+    const result = await trx('invoices')
+      .where(where)
+      .update({ ...updates, ...versionUpdate, updated_at: nowValue() })
+      .returning('*');
+
+    let persisted;
+    if (Array.isArray(result) && result.length > 0 && typeof result[0] === 'object') {
+      persisted = normalizeInvoiceVersion(result[0]);
+    } else if (typeof result === 'number') {
+      if (result === 0) {
+        const err = new Error(
+          `Concurrent modification of invoice ${invoiceId}; transition from ${invoice.status} to ${targetState} aborted`,
+        );
+        err.code = 'TRANSITION_CONFLICT';
+        err.statusCode = 409;
+        throw err;
+      }
+      persisted = await trx('invoices').where({ invoice_id: invoiceId, tenant_id: tenantId }).first();
+    } else {
+      // Empty returning array under Postgres
+      const latest = await trx('invoices').where({ invoice_id: invoiceId, tenant_id: tenantId }).first();
+      if (!latest) {
+        const err = new Error('Invoice not found');
+        err.code = 'INVOICE_NOT_FOUND';
+        err.statusCode = 404;
+        throw err;
+      }
+      if (invoice.version !== undefined && requireStoredVersion(latest) !== requireStoredVersion(invoice) + 1) {
+        const err = new Error(
+          `Concurrent modification of invoice ${invoiceId}; transition from ${invoice.status} to ${targetState} aborted`,
+        );
+        err.code = 'TRANSITION_CONFLICT';
+        err.statusCode = 409;
+        throw err;
+      }
+      persisted = normalizeInvoiceVersion(latest);
+    }
+
+    if (!persisted) {
+      const err = new Error(
+        `Concurrent modification of invoice ${invoiceId}; transition from ${invoice.status} to ${targetState} aborted`,
+      );
+      err.code = 'TRANSITION_CONFLICT';
+      err.statusCode = 409;
       throw err;
     }
 
-    const retryValidation = validateTransition({
+    // Write outbox event atomically with the invoice mutation
+    await insertOutboxEvent(trx, {
       invoiceId,
-      currentState: latest.status,
-      targetState,
-      actor,
-      reason,
+      tenantId,
+      event: outboxEvent,
+      payload: { invoiceId, event: outboxEvent, transition: { from: invoice.status, to: targetState, actor, reason } },
+      correlationId,
     });
-    if (!retryValidation.isValid) {
-      const error = new Error(retryValidation.error);
-      error.code = retryValidation.code;
-      error.allowedTransitions = retryValidation.allowedTransitions;
-      throw error;
-    }
+  });
 
-    const err = new Error(
-      `Concurrent modification of invoice ${invoiceId}; transition from ${invoice.status} to ${targetState} aborted`,
-    );
-    err.code = 'TRANSITION_CONFLICT';
-    err.statusCode = 409;
-    throw err;
-  }
-
-  // Persist succeeded — emit audit trail for the winning transition only.
-  return executeTransition({
+  // Transaction committed - emit audit trail for the winning transition only.
+  const transitionResult = await executeTransition({
     invoiceId,
     currentState: invoice.status,
     targetState,
@@ -666,6 +781,19 @@ async function transitionInvoice(invoiceId, targetState, tenantId, options = {})
     userAgent,
     metadata,
   });
+
+  // Fire-and-forget low-latency delivery; if this fails the outbox worker retries.
+  const { enqueueWebhookDelivery } = require('./webhooks');
+  enqueueWebhookDelivery({
+    invoiceId,
+    event: outboxEvent,
+    correlationId,
+    transition: { from: invoice.status, to: targetState, actor, reason, transitionedAt: transitionResult.auditLog.timestamp },
+  }).catch((err) => {
+    logger.warn({ invoiceId, error: err.message }, 'webhook: low-latency delivery failed, outbox worker will retry');
+  });
+
+  return transitionResult;
 }
 
 // ---------------------------------------------------------------------------
@@ -676,10 +804,10 @@ async function transitionInvoice(invoiceId, targetState, tenantId, options = {})
  * Status-to-category mapping for SME dashboard metrics.
  *
  * Each invoice status maps to exactly one dashboard category:
- * - **open** � invoices awaiting verification or verified but not yet funded.
- * - **funded** � invoices that have been funded but not yet settled.
- * - **settled** � invoices that are fully settled or paid.
- * - **defaulted** � invoices that have entered default.
+ * - **open** — invoices awaiting verification or verified but not yet funded.
+ * - **funded** — invoices that have been funded but not yet settled.
+ * - **settled** — invoices that are fully settled or paid.
+ * - **defaulted** — invoices that have entered default.
  *
  * Statuses **not** listed here (e.g. `withdrawn`) are intentionally excluded
  * from every category so they do not inflate any bucket.
@@ -699,7 +827,7 @@ const STATUS_CATEGORY_MAP = {
  * Pre-computed grouping of statuses by dashboard category, derived once
  * from {@link STATUS_CATEGORY_MAP} at module load.
  *
- * E.g.: `{ open: ['pending_verification', 'verified'], funded: ['funded'], � }`
+ * E.g.: `{ open: ['pending_verification', 'verified'], funded: ['funded'], … }`
  *
  * @constant {Record<string, string[]>}
  */
@@ -729,9 +857,9 @@ const CATEGORY_NAMES = Object.keys(CATEGORY_STATUSES);
  *
  * The query produces a single database row with one integer column per
  * category defined in {@link STATUS_CATEGORY_MAP} (`open`, `funded`,
- * `settled`, `defaulted`).  The `SUM(CASE �)` clauses are built
+ * `settled`, `defaulted`).  The `SUM(CASE …)` clauses are built
  * **programmatically** from {@link STATUS_CATEGORY_MAP} so the constant
- * is the single source of truth � adding or removing a status mapping
+ * is the single source of truth — adding or removing a status mapping
  * automatically updates the aggregation without touching the SQL.
  *
  * Statuses not listed in the map (e.g. `withdrawn`) are excluded from
@@ -745,7 +873,7 @@ const CATEGORY_NAMES = Object.keys(CATEGORY_STATUSES);
  * @throws {TypeError} When tenantId or userId is missing or not a non-empty string.
  *
  * @security
- *   - Scoped to `tenant_id` and `sme_id` on every query � no cross-tenant or
+ *   - Scoped to `tenant_id` and `sme_id` on every query — no cross-tenant or
  *     cross-owner data leakage.
  *   - Uses positional (parameterised) bindings via Knex `.where()`.
  */
@@ -763,7 +891,7 @@ async function getSmeInvoiceCounts(tenantId, userId) {
   const selectClauses = CATEGORY_NAMES.map((category) => {
     const statuses = CATEGORY_STATUSES[category];
     // Status values come from the hardcoded STATUS_CATEGORY_MAP constant,
-    // so string interpolation is safe here � no user input reaches this path.
+    // so string interpolation is safe here — no user input reaches this path.
     const inClause = statuses.map((s) => `'${s}'`).join(', ');
     return db.raw(
       `SUM(CASE WHEN status IN (${inClause}) THEN 1 ELSE 0 END) AS ??`,
@@ -796,13 +924,13 @@ async function getSmeInvoiceCounts(tenantId, userId) {
  * malformed or tampered cursors throw {@link CursorError}.
  *
  * When no cursor is supplied the first page is returned.
- * The caller controls page size via `limit` (1�100, default 20).
+ * The caller controls page size via `limit` (1–100, default 20).
  *
  * @param {string} tenantId - Tenant identifier (required).
  * @param {string} userId   - SME owner identifier (required).
  * @param {object} [options={}]
  * @param {string} [options.cursor] - Opaque cursor from a prior page.
- * @param {number} [options.limit=20] - Max rows per page (clamped to 1�100).
+ * @param {number} [options.limit=20] - Max rows per page (clamped to 1–100).
  * @returns {Promise<{invoices: object[], meta: {total: number, limit: number, hasMore: boolean, nextCursor: string|null}}>}
  * @throws {TypeError}   When tenantId or userId is missing.
  * @throws {CursorError} When the cursor is malformed, tampered, or expired.
@@ -876,7 +1004,7 @@ async function getSmeInvoiceList(tenantId, userId, { cursor, limit = 20 } = {}) 
 }
 
 // ---------------------------------------------------------------------------
-// KYC helpers (in-memory � retained for backward compat with existing tests)
+// KYC helpers (in-memory — retained for backward compat with existing tests)
 // ---------------------------------------------------------------------------
 
 /**

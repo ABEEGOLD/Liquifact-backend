@@ -1,3 +1,4 @@
+
 'use strict';
 
 /**
@@ -7,8 +8,9 @@
  * admin callers. The endpoint requires a valid JWT bearer token or API key and
  * applies the standard admin middleware stack (auth → tenant extraction).
  *
- * Payload JSONB is intentionally excluded from list rows — it may contain
- * sensitive job arguments that should not be exposed in bulk listings.
+ * Payload JSONB and lease fencing tokens are intentionally excluded from list
+ * rows — they may contain sensitive job arguments or grant write access that
+ * should not be exposed in bulk listings.
  *
  * ## Pagination
  *
@@ -41,6 +43,8 @@ const {
   LIST_JOBS_MAX_LIMIT,
   LIST_JOBS_SORT_FIELDS,
 } = require('../workers/jobPersistence');
+const { withRetry } = require('../utils/retry');
+const { JobCursorError: _JobCursorError } = require('../workers/jobPersistence');
 
 // Apply admin auth (JWT or API key) + tenant extraction to every route in this file.
 router.use(...adminStack);
@@ -66,8 +70,9 @@ router.use(...adminStack);
  *
  *       Cursors are opaque HMAC-signed tokens. Any modification returns 400.
  *
- *       **Note**: `payload` is intentionally excluded from every row to prevent
- *       sensitive job arguments from leaking in bulk API responses.
+ *       **Note**: `payload` and lease fencing tokens are intentionally excluded
+ *       from every row to prevent sensitive job arguments or write credentials
+ *       from leaking in bulk API responses.
  *
  *     tags: [Admin, Jobs]
  *     security:
@@ -160,7 +165,7 @@ router.use(...adminStack);
  *
  * Response 200:
  *   Standard success envelope whose `data` array contains job summary objects
- *   (payload excluded) and whose `meta` carries cursor pagination fields.
+ *   (payload and fencing tokens excluded) and whose `meta` carries cursor pagination fields.
  *
  * Response 400:
  *   When query parameters are invalid or the cursor is tampered/malformed.
@@ -170,6 +175,7 @@ router.use(...adminStack);
  * @param {import('express').NextFunction} next - Express next.
  * @returns {Promise<void>}
  */
+const LIST_JOBS_MAX_ATTEMPTS = 3;
 router.get('/', async (req, res, next) => {
   // ── Input validation ────────────────────────────────────────────────────
   const rawLimit  = req.query.limit;
@@ -219,14 +225,31 @@ router.get('/', async (req, res, next) => {
     const dbClient   = req._dbClient || db;
     const persistence = createJobPersistence(dbClient);
 
-    const result = await persistence.listJobs({
-      limit:  rawLimit  !== undefined ? parseInt(rawLimit, 10)   : LIST_JOBS_DEFAULT_LIMIT,
-      cursor: req.query.cursor,
-      sortBy: rawSortBy,
-      order:  rawOrder,
-      status: rawStatus,
-      type:   req.query.type,
-    });
+    // Deterministic retry: only transient dependency failures are retried.
+    // Cursor errors (JobCursorError) are terminal and must never be retried,
+    // because a tampered cursor will never succeed on retry and would mask
+    // the 400 response. Retries are bounded and use the same cursor/params,
+    // so a partial failure cannot produce a different page than a success.
+    const result = await withRetry(
+      () => persistence.listJobs({
+        limit:  rawLimit  !== undefined ? parseInt(rawLimit, 10)   : LIST_JOBS_DEFAULT_LIMIT,
+        cursor: req.query.cursor,
+        sortBy: rawSortBy,
+        order:  rawOrder,
+        status: rawStatus,
+        type:   req.query.type,
+      }),
+      {
+        maxAttempts: LIST_JOBS_MAX_ATTEMPTS,
+        shouldRetry: (err) => !(err instanceof JobCursorError),
+        onRetry: (err, attempt) => {
+          logger.warn(
+            { err: err?.message, attempt, tenantId: req.tenantId, requestId: req.id },
+            'Retrying admin jobs listing after transient failure',
+          );
+        },
+      },
+    );
 
     logger.info(
       {
@@ -235,12 +258,22 @@ router.get('/', async (req, res, next) => {
         limit:     result.meta.limit,
         hasMore:   result.meta.hasMore,
         count:     result.data.length,
+        attempts:  result.attempts,
       },
       'Admin jobs listing retrieved',
     );
 
+    const data = result.data.map((job) => {
+      const safeJob = { ...job };
+      // Never expose lease fencing tokens; doing so would let a stale worker
+      // bypass the fencing token check after its lease has been reassigned.
+      delete safeJob.lease_token;
+      delete safeJob.payload;
+      return safeJob;
+    });
+
     return res.status(200).json({
-      ...responseHelper.success(result.data, result.meta),
+      ...responseHelper.success(data, result.meta),
       message: 'Background jobs retrieved successfully.',
     });
   } catch (err) {
@@ -251,7 +284,7 @@ router.get('/', async (req, res, next) => {
     }
 
     logger.error(
-      { err: err?.message, tenantId: req.tenantId },
+      { err: err?.message, tenantId: req.tenantId, requestId: req.id },
       'Failed to fetch persisted jobs listing',
     );
     return next(err);
@@ -259,3 +292,4 @@ router.get('/', async (req, res, next) => {
 });
 
 module.exports = router;
+module.exports.LIST_JOBS_MAX_ATTEMPTS = LIST_JOBS_MAX_ATTEMPTS;

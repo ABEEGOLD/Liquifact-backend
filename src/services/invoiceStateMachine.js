@@ -2,6 +2,7 @@
 
 const { createAuditLog } = require('./auditLog');
 const logger = require('../logger');
+const { get: getContext } = require('../requestContext');
 
 /**
  * Canonical invoice status vocabulary shared by invoice-list and marketplace
@@ -193,7 +194,7 @@ function normalizeTransitionReason(reason) {
  *   Validation result.
  */
 function validateTransition(ctx) {
-  const { invoiceId, currentState, targetState, actor } = ctx || {};
+  const { invoiceId, currentState, targetState, actor, revision } = ctx || {};
 
   if (!invoiceId) {
     return { isValid: false, code: 'MISSING_INVOICE_ID' };
@@ -206,6 +207,9 @@ function validateTransition(ctx) {
   }
   if (!actor) {
     return { isValid: false, code: 'MISSING_ACTOR' };
+  }
+  if (!revision) {
+    return { isValid: false, code: 'MISSING_REVISION' };
   }
   if (currentState === targetState) {
     return { isValid: false, code: 'ALREADY_IN_TARGET_STATE' };
@@ -255,6 +259,7 @@ function validateTransition(ctx) {
  */
 function buildTransitionError(code, message, statusCode = 400, allowedTransitions) {
   const err = new Error(message);
+  err.name = 'StateTransitionError';
   err.code = code;
   err.statusCode = statusCode;
   if (allowedTransitions) {
@@ -287,6 +292,7 @@ async function executeTransition(ctx) {
       MISSING_CURRENT_STATE: 'Current state is required.',
       MISSING_TARGET_STATE: 'Target state is required.',
       MISSING_ACTOR: 'Actor is required.',
+      MISSING_REVISION: 'Invoice revision is required.',
       INVALID_CURRENT_STATE: 'Current state is not recognised.',
       INVALID_TARGET_STATE: 'Target state is not recognised.',
       ALREADY_IN_TARGET_STATE: 'Invoice is already in the target state.',
@@ -305,8 +311,8 @@ async function executeTransition(ctx) {
     );
   }
 
-  const { invoiceId, currentState, targetState, actor, ipAddress = 'unknown', userAgent = 'unknown', metadata = {} } = ctx;
-  const reason = ctx.reason != null ? normalizeTransitionReason(ctx.reason) : undefined;
+  const { invoiceId, currentState, targetState, actor, revision, ipAddress = 'unknown', userAgent = 'unknown', metadata = {} } = ctx;
+  const reason = validation.reason || undefined;
 
   const auditLog = await createAuditLog({
     actor,
@@ -319,6 +325,7 @@ async function executeTransition(ctx) {
     userAgent,
     metadata: {
       ...metadata,
+      revision,
       reason: reason || null,
       transitionType: `${currentState}_to_${targetState}`,
     },
@@ -334,12 +341,14 @@ async function executeTransition(ctx) {
 
   const transitionedAt = auditLog.timestamp;
   const event = `invoice.${currentState}_to_${targetState}`;
+  const correlationId = getContext().correlationId || null;
 
   // Fire-and-forget enqueue of signed webhook delivery
   const { enqueueWebhookDelivery } = require('./webhooks');
   enqueueWebhookDelivery({
     invoiceId,
     event,
+    correlationId,
     transition: {
       from: currentState,
       to: targetState,
@@ -355,7 +364,7 @@ async function executeTransition(ctx) {
     success: true,
     previousState: currentState,
     newState: targetState,
-    auditLog,
+    revision,
     transitionedAt,
     transitionedBy: actor,
     auditLog,
@@ -417,4 +426,5 @@ module.exports = {
   executeTransition,
   getTransitionHistory,
   canLinkToEscrow,
+  buildTransitionError,
 };

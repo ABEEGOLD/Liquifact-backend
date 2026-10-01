@@ -5,11 +5,20 @@
  * 1. CORS policy (environment-driven allowlist, 403 on blocked origins)
  * 2. Request body-size guardrails (100 KB global JSON, 512 KB invoice limit)
  * 3. URL-encoded body parser (50 KB limit)
- * 4. Application routes (health, api-info, invoices, escrow)
- * 5. 404 catch-all
- * 6. CORS error handler  → 403 JSON
- * 7. Payload-too-large handler → 413 JSON
- * 8. Generic internal-error handler → 500 JSON
+ * 4. Input sanitization (strips control chars, normalises Unicode, removes
+ *    prototype-pollution keys from body / params / query)
+ * 5. Security headers, audit, request-id, correlation-id middleware
+ * 6. Application routes — each with explicit validation boundaries:
+ *    - Health / liveness / readiness probes  (query + body guards)
+ *    - GET /api info                         (query guard + body guard)
+ *    - GET  /api/invoices                    (query param validation)
+ *    - POST /api/invoices                    (Zod body schema + 512 KB limit)
+ *    - GET  /api/escrow/:invoiceId           (param allowlist + length bound)
+ * 7. Feature router mounts (auth, KYC, marketplace, …)
+ * 8. 404 catch-all
+ * 9. CORS error handler  → 403 JSON
+ * 10. Payload-too-large handler → 413 JSON
+ * 11. Generic internal-error handler → 500 JSON
  *
  * @module app
  */
@@ -22,12 +31,14 @@ const express = require('express');
 const cors = require('cors');
 const { createSecurityMiddleware } = require('./middleware/security');
 const { auditMiddleware } = require('./middleware/audit');
+
 const requestId = require('./middleware/requestId');
 const { correlationIdMiddleware } = require('./middleware/correlationId');
 const invoiceService = require('./services/invoiceService');
 const { CursorError } = require('./utils/cursorPagination');
 const { getEscrowRead } = require('./services/escrowReadService');
 const { createCorsOptions, isCorsOriginRejectedError } = require('./config/cors');
+const { corsObservability } = require('./middleware/corsObservability');
 const { get: getConfig } = require('./config');
 const { validateInvoiceQueryParams } = require('./utils/validators');
 const { invoiceCreateSchema, parseValidationErrors } = require('./schemas/invoice');
@@ -54,7 +65,7 @@ const marketplaceRoutes = require('./routes/marketplace');
 const retentionRoutes = require('./routes/retention');
 const invoiceStateRoutes = require('./routes/invoiceStateRoutes');
 const adminEscrowRoutes = require('./routes/adminEscrow');
-const adminInvoiceStateRoutes = require('./routes/adminInvoiceState');
+const adminEscrowReadRoutes = require('./routes/adminEscrowRead');
 const adminWebhooksRoutes = require('./routes/adminWebhooks');
 const adminConfigRoutes = require('./routes/adminConfig');
 const kycRoutes = require('./routes/kyc');
@@ -70,6 +81,13 @@ const {
   resetFeatureRouterMounts,
 } = require('./utils/routeMountRegistry');
 const { createCompressionMiddleware } = require('./middleware/compression');
+const { configErrorHandler } = require('./middleware/configErrorHandler');
+const { sanitizeInput } = require('./middleware/sanitizeInput');
+const {
+  validateEscrowParamsMiddleware,
+  validateApiInfoQuery,
+  rejectBodyOnGet: rejectBodyOnGetInfo,
+} = require('./schemas/appBoundary');
 
 /**
  * Returns a 403 JSON response only for the dedicated blocked-origin CORS error.
@@ -82,6 +100,7 @@ const { createCompressionMiddleware } = require('./middleware/compression');
  */
 function handleCorsError(err, req, res, next) {
   if (isCorsOriginRejectedError(err)) {
+    if (res.locals) res.locals.isCorsOriginRejected = true;
     res.status(403).json({ error: err.message, code: err.code });
     return;
   }
@@ -140,19 +159,30 @@ function handleInternalError(err, req, res, _next) {
  * @returns {import('express').Express} Configured Express application.
  */
 function createApp() {
-  resetFeatureRouterMounts();
   const app = express();
 
   // ── 1. CORS ──────────────────────────────────────────────────────────────
+  app.use(corsObservability);
   app.use(cors(createCorsOptions()));
 
   // ── 1.a. KYC webhook raw body parser ──────────────────────────────────────
   // Incoming provider webhooks must be verified against the raw JSON body.
-  app.use('/api/kyc/webhook', express.raw({ type: 'application/json', limit: '100kb' }));
+  app.use('/api/kyc/webhook', express.raw({
+    type: 'application/json',
+    limit: KYC_WEBHOOK_VALIDATION.MAX_PAYLOAD_BYTES,
+  }));
 
   // ── 2 & 3. Body-size guardrails ──────────────────────────────────────────
   app.use(...jsonBodyLimit());
   app.use(...urlencodedBodyLimit());
+
+  // ── 4. Input sanitization ────────────────────────────────────────────────
+  // Runs after body parsers so req.body / req.params / req.query are already
+  // populated.  Strips control characters, normalises Unicode, and removes
+  // prototype-pollution keys from every user-supplied input container.
+  // Validation schemas then enforce structural correctness on top of this
+  // already-clean input.
+  app.use(sanitizeInput);
 
   // Apply security headers middleware
   app.use(createSecurityMiddleware());
@@ -160,7 +190,7 @@ function createApp() {
   app.use(requestId);
   app.use(correlationIdMiddleware);
 
-  // ── 4. Routes ────────────────────────────────────────────────────────────
+  // ── 5. Routes ────────────────────────────────────────────────────────────
 
   // ── Health / Liveness / Readiness ──────────────────────────────────────
   // Issue #769 — per-client rate limiter before individual handlers.
@@ -232,8 +262,8 @@ function createApp() {
     }
   }));
 
-  // API info
-  app.get('/api', (req, res) => {
+  // API info — read-only metadata; reject query params and bodies (GET invariant)
+  app.get('/api', rejectBodyOnGetInfo, validateApiInfoQuery, (req, res) => {
     res.json({
       name: 'LiquiFact API',
       description: 'Global Invoice Liquidity Network on Stellar',
@@ -311,63 +341,32 @@ function createApp() {
     });
   });
 
-  // Escrow — GET by invoiceId (delegates to escrowReadService)
-  app.get('/api/escrow/:invoiceId', async (req, res) => {
-    const invoiceId = String(req.params.invoiceId || '').trim();
+  // Escrow — GET by invoiceId (proxied through Soroban retry wrapper with address mapping)
+  // Compression middleware: gzip/deflate for large escrow-read responses (issue #961).
+  // Threshold: 1 KB (DEFAULT_THRESHOLD). Respects Accept-Encoding; small responses
+  // pass through uncompressed. Vary: Accept-Encoding is always set.
+  //
+  // Validation order:
+  //   1. validateEscrowParamsMiddleware — allowlist + length bound on :invoiceId (400 on failure)
+  //   2. createCompressionMiddleware()  — content-encoding negotiation
+  //   3. handler                        — uses req.validatedParams.invoiceId (schema-safe value)
+  app.get('/api/escrow/:invoiceId', validateEscrowParamsMiddleware, createCompressionMiddleware(), async (req, res, next) => {
+    // Use the schema-validated param; fall back to raw only during unit-test
+    // scenarios where the middleware was bypassed explicitly.
+    const invoiceId = req.validatedParams
+      ? req.validatedParams.invoiceId
+      : String(req.params.invoiceId || '').trim().replace(/\s+/g, '');
+
     const { result, escrowAddress, error, code, statusCode } = await getEscrowRead(invoiceId);
 
     if (error) {
       return res.status(statusCode).json({ error, code });
-  // Compression middleware: gzip/deflate for large escrow-read responses (issue #961).
-  // Threshold: 1 KB (DEFAULT_THRESHOLD). Respects Accept-Encoding; small responses
-  // pass through uncompressed. Vary: Accept-Encoding is always set.
-  app.get('/api/escrow/:invoiceId', createCompressionMiddleware(), async (req, res) => {
-    const invoiceId = String(req.params.invoiceId || '')
-      .trim()
-      .replace(/\s+/g, '');
-
-    try {
-      // Resolve escrow contract address using the mapping system
-      const escrowAddress = resolveEscrowAddress(invoiceId);
-
-      if (!escrowAddress) {
-        return next(new AppError({
-          type: 'https://liquifact.com/probs/not-found',
-          title: 'Not Found',
-          status: 404,
-          detail: `No escrow contract mapping found for invoice ID '${invoiceId}'`,
-          code: 'NOT_FOUND',
-          retryable: false,
-        }));
-      }
-
-      // Read from projection, cache, or live read fallback
-      const state = await getEscrowStateWithProjection(invoiceId);
-
-      const derived = computeEscrowDerivedFields(state);
-
-      const data = {
-        ...state,
-        ...derived,
-        escrowAddress
-      };
-
-      // Include escrow address in response headers
-      res.set('X-Escrow-Address', escrowAddress);
-      res.json({
-        data,
-        message: state.fromProjection 
-          ? 'Escrow state read from event projection.'
-          : 'Escrow state read from live Soroban contract.',
-      });
-    } catch (error) {
-      return next(error);
     }
 
     res.set('X-Escrow-Address', escrowAddress);
-    res.json({
-      data: result,
-      message: result.fromProjection
+    return res.json({
+      ...responseHelper.success(result),
+      message: result && result.fromProjection
         ? 'Escrow state read from event projection.'
         : 'Escrow state read from live Soroban contract.',
     });
@@ -420,17 +419,21 @@ function createApp() {
   mountFeatureRouter(app, '/api/retention', retentionRoutes);
   mountFeatureRouter(app, '/api/admin/audit', auditTrailRoutes);
   mountFeatureRouter(app, '/api/admin/escrow', adminEscrowRoutes);
-  mountFeatureRouter(app, '/api/admin/invoices', adminInvoiceStateRoutes);
+  mountFeatureRouter(app, '/api/admin/escrow-read', adminEscrowReadRoutes);
   mountFeatureRouter(app, '/api/admin/webhooks', adminWebhooksRoutes);
-  mountFeatureRouter(app, '/api/admin/config', adminConfigRoutes);
+  if (getConfig().CONFIG_RUNTIME_ENABLED === 'true') {
+    mountFeatureRouter(app, '/api/admin/config', adminConfigRoutes);
+  }
   mountFeatureRouter(app, '/api/admin/reconciliation', reconciliationRoutes);
-  mountFeatureRouter(app, '/api/admin/indexer', adminIndexerRoutes);
+  if (getConfig().ESCROW_INDEXER_ENABLED === 'true') {
+    mountFeatureRouter(app, '/api/admin/indexer', adminIndexerRoutes);
+  }
   mountFeatureRouter(app, '/api/admin/metrics', adminMetricsRoutes);
   mountFeatureRouter(app, '/api/admin/kyc', adminKycRoutes);
   mountFeatureRouter(app, '/v1', v1Routes);
   mountFeatureRouter(app, '/api', apiKeysRoutes);
 
-  assertNoDuplicateRouterMounts();
+  assertNoDuplicateRouterMounts(app);
 
   // ── 6. Prometheus metrics ────────────────────────────────────────────────
   // Rate limiter mounted BEFORE metricsAuth so unauthenticated attempts
@@ -446,6 +449,7 @@ function createApp() {
   // ── 8 – 10. Error handlers (order matters) ───────────────────────────────
   app.use(handleCorsError);
   app.use(payloadTooLargeHandler);
+  app.use(configErrorHandler);
   app.use(handleInternalError);
 
   return app;

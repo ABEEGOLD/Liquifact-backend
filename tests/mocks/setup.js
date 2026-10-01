@@ -1,3 +1,63 @@
+jest.mock('../../src/metrics', () => {
+  const makeCounter = () => ({
+    inc: jest.fn(),
+    reset: jest.fn(),
+    val: 0,
+  });
+
+  // Shared in-memory prom-client registry stub. Returned by getRegistry() so
+  // that job modules using _counter() / new Counter({ registers: [getRegistry()] })
+  // can resolve counters without hitting the real prom-client registry (which
+  // is process-global and throws "already registered" across test suites).
+  const _registryStub = {
+    getSingleMetric: jest.fn().mockReturnValue(null),
+    registerMetric: jest.fn(),
+  };
+
+  return {
+    // Registry accessor used by job helpers (_counter, etc.) — must be present
+    // so any job module that calls getRegistry() at load time does not throw.
+    getRegistry: jest.fn().mockReturnValue(_registryStub),
+
+    footprintCacheHitsTotal: makeCounter(),
+    footprintCacheMissesTotal: makeCounter(),
+    footprintCacheEvictionsTotal: makeCounter(),
+    // CORS origin-cache counters used by config/corsCache in CORS policy tests.
+    corsCacheHitsTotal: makeCounter(),
+    corsCacheMissesTotal: makeCounter(),
+    corsCacheEvictionsTotal: makeCounter(),
+    corsCacheInvalidationsTotal: makeCounter(),
+
+    // API-key registry cache counters (issue #1266) — so apiKeysCache.js can
+    // count hits/misses under test exactly as it does in production.
+    apiKeysCacheHitsTotal: makeCounter(),
+    apiKeysCacheMissesTotal: makeCounter(),
+
+    // KYC webhook metrics — needed so route handlers can call
+    // normalizeKycWebhookStatusClass / normalizeKycWebhookCause
+    // in their res.on('finish') callbacks without crashing.
+    kycWebhookRequestDurationSeconds: { observe: jest.fn() },
+    kycWebhookRequestsTotal: { inc: jest.fn() },
+    kycWebhookErrorsTotal: { inc: jest.fn() },
+    normalizeKycWebhookStatusClass: jest.fn().mockReturnValue('4xx'),
+    normalizeKycWebhookCause: jest.fn().mockReturnValue('none'),
+
+    // Invoice-state request metrics — needed so
+    // middleware/invoiceStateMetrics.js's res.on('finish') callback (wired
+    // into every invoice-state route) doesn't crash in tests that exercise
+    // those routes without their own local metrics mock.
+    invoiceStateRequestDurationMs: { labels: jest.fn().mockReturnThis(), observe: jest.fn() },
+    invoiceStateRequestCount: { labels: jest.fn().mockReturnThis(), inc: jest.fn() },
+
+    // Job queue and worker registration functions — needed by JobQueue
+    // constructor and BackgroundWorker to register themselves for metrics.
+    registerJobQueue: jest.fn(),
+    registerWorker: jest.fn(),
+    metricsAuth: (req, res, next) => next(),
+    metricsHandler: (_req, res) => res.status(200).send(''),
+  };
+});
+
 const { CircuitBreaker: _CircuitBreaker } = require('../../src/utils/circuitBreaker');
 const { MemoryCacheStore: _MemoryCacheStore } = require('../../src/services/cacheStore');
 globalThis.CircuitBreaker = _CircuitBreaker;
@@ -20,6 +80,7 @@ jest.mock('../../src/db/knex', () => {
   const auditLogEvents = [];
   const investorLocks = [];
   const invoiceFiles = [];
+  const quarantineRecords = [];
   let queryWheres = {};
   let mockCurrentTable;
   let _lastInserted = null;
@@ -34,6 +95,13 @@ jest.mock('../../src/db/knex', () => {
 
   const filterInvoiceFiles = () => invoiceFiles.filter((row) => {
     return Object.entries(queryWheres).every(([key, value]) => row[key] === value);
+  });
+
+  const filterQuarantineRecords = () => quarantineRecords.filter((row) => {
+    return Object.entries(queryWheres).every(([key, value]) => {
+      if (key === 'created_at') return true;
+      return String(row[key]) === String(value);
+    });
   });
 
   const m = jest.fn((table) => {
@@ -79,6 +147,9 @@ jest.mock('../../src/db/knex', () => {
     if (mockCurrentTable === "invoice_files") {
       invoiceFiles.push(...inserted);
     }
+    if (mockCurrentTable === "kyc_webhook_quarantine") {
+      quarantineRecords.push(...inserted);
+    }
     return m;
   });
   m.onConflict = jest.fn().mockReturnThis();
@@ -121,6 +192,9 @@ jest.mock('../../src/db/knex', () => {
     if (mockCurrentTable === "invoice_files") {
       return Promise.resolve(filterInvoiceFiles()[0]);
     }
+    if (mockCurrentTable === "kyc_webhook_quarantine") {
+      return Promise.resolve(filterQuarantineRecords()[0] || null);
+    }
     return Promise.resolve({ id: 'test', kyc_status: 'approved' });
   });
   m.returning = jest.fn(() => {
@@ -131,6 +205,10 @@ jest.mock('../../src/db/knex', () => {
       const retained = investorLocks.filter((row) => !Object.entries(queryWheres).every(([key, value]) => row[key] === value));
       investorLocks.length = 0;
       investorLocks.push(...retained);
+      return Promise.resolve(1);
+    }
+    if (mockCurrentTable === "kyc_webhook_quarantine") {
+      quarantineRecords.length = 0;
       return Promise.resolve(1);
     }
     auditLogEvents.length = 0;
@@ -158,6 +236,52 @@ jest.mock('../../src/db/knex', () => {
   m.fn = { now: jest.fn(() => new Date().toISOString()) };
   m.migrate = { latest: jest.fn().mockResolvedValue([0, []]) };
   m.destroy = jest.fn().mockResolvedValue(undefined);
+
+  // -------------------------------------------------------------------------
+  // Idempotent teardown helpers — mirrors the real src/db/knex.js API added
+  // in issue #1330. destroyOnce() coalesces concurrent destroy calls onto a
+  // single Promise so tests can assert teardown happens exactly once.
+  // -------------------------------------------------------------------------
+  let _destroyOnceCalled = 0;
+  let _destroyOncePromise = null;
+
+  m.destroyOnce = jest.fn(() => {
+    if (_destroyOncePromise !== null) { return _destroyOncePromise; }
+    _destroyOnceCalled += 1;
+    _destroyOncePromise = m.destroy();
+    return _destroyOncePromise;
+  });
+
+  // Health-check snapshot — returns healthy by default.
+  m.getHealthInfo = jest.fn(async () => ({
+    status: 'healthy',
+    latencyMs: 1,
+    lastHealthyAt: new Date().toISOString(),
+    error: null,
+  }));
+
+  // Test-only helpers for introspection and state reset.
+  m._getDestroyCallCount = () => _destroyOnceCalled;
+  m._isDestroyed = () => _destroyOnceCalled > 0;
+  m._setHealthResponse = (response) => {
+    const defaults = { status: 'healthy', latencyMs: 1, lastHealthyAt: new Date().toISOString(), error: null };
+    m.getHealthInfo.mockImplementationOnce(async () => ({ ...defaults, ...response }));
+  };
+  m._reset = () => {
+    _destroyOnceCalled = 0;
+    _destroyOncePromise = null;
+    m.destroy.mockReset();
+    m.destroy.mockResolvedValue(undefined);
+    m.destroyOnce.mockReset();
+    m.destroyOnce.mockImplementation(() => {
+      if (_destroyOncePromise !== null) { return _destroyOncePromise; }
+      _destroyOnceCalled += 1;
+      _destroyOncePromise = m.destroy();
+      return _destroyOncePromise;
+    });
+    m.getHealthInfo.mockReset();
+    m.getHealthInfo.mockResolvedValue({ status: 'healthy', latencyMs: 1, lastHealthyAt: new Date().toISOString(), error: null });
+  };
   m.then = jest.fn((onFulfilled) => {
     if (m._resolveValue) {
       const rv = m._resolveValue;
@@ -185,6 +309,16 @@ jest.mock('../../src/db/knex', () => {
     }
     if (mockCurrentTable === "invoice_files") {
       return Promise.resolve(filterInvoiceFiles()).then(onFulfilled);
+    }
+    if (mockCurrentTable === "kyc_webhook_quarantine") {
+      let results = filterQuarantineRecords();
+      if (_offset) {
+        results = results.slice(_offset);
+      }
+      if (_limit !== null) {
+        results = results.slice(0, _limit);
+      }
+      return Promise.resolve(results).then(onFulfilled);
     }
     return Promise.resolve([]).then(onFulfilled);
   });
@@ -287,12 +421,18 @@ jest.mock('../../src/middleware/rateLimit', () => {
     globalLimiter: noopMiddleware,
     sensitiveLimiter: noopMiddleware,
     apiKeyLimiter: noopMiddleware,
+    apiKeysLimiter: noopMiddleware,
+    createApiKeysRateLimiter: jest.fn(() => noopMiddleware),
+    apiKeysRateLimitHandler: jest.fn(),
+    API_KEYS_RATE_LIMIT_WINDOW_MS: 900000,
+    API_KEYS_RATE_LIMIT_MAX: 60,
     adminConfigLimiter: noopMiddleware,
     metricsLimiter: noopMiddleware,
     healthLimiter: noopMiddleware,
     metricsLimiter: noopMiddleware,
     createConfigRateLimiter: jest.fn(() => noopMiddleware),
     createMetricsRateLimiter: jest.fn(() => noopMiddleware),
+    metricsRateLimitHandler: jest.fn(),
     invoiceStateLimiter: noopMiddleware,
     escrowReadLimiter: noopMiddleware,
     indexerLimiter: noopMiddleware,
@@ -317,12 +457,14 @@ jest.mock('../../src/middleware/rateLimit', () => {
     METRICS_RATE_LIMIT_MAX: 30,
     CONFIG_RATE_LIMIT_WINDOW_MS: 60000,
     CONFIG_RATE_LIMIT_MAX: 20,
-    HEALTH_RATE_LIMIT_WINDOW_MS: 15000,
-    HEALTH_RATE_LIMIT_MAX: 60,
     METRICS_RATE_LIMIT_WINDOW_MS: 60000,
     METRICS_RATE_LIMIT_MAX: 30,
+    HEALTH_RATE_LIMIT_WINDOW_MS: 15000,
+    HEALTH_RATE_LIMIT_MAX: 60,
     metricsLimiter: noopMiddleware,
-    metricsRateLimitHandler: jest.fn(),
     createMetricsRateLimiter: jest.fn(() => noopMiddleware),
+    metricsRateLimitHandler: jest.fn(),
+    METRICS_RATE_LIMIT_WINDOW_MS: 60000,
+    METRICS_RATE_LIMIT_MAX: 30,
   };
 }, { virtual: true });

@@ -11,9 +11,12 @@
  */
 
 const { z } = require('zod');
+const { KYC_WEBHOOK_VALIDATION } = require('../constants/kycWebhooks');
 
 /** SME identifier: 1–128 alphanumeric, underscore, or hyphen characters. */
-const SME_ID_REGEX = /^[a-zA-Z0-9_-]{1,128}$/;
+// This trusted pattern is assembled from frozen local validation constants.
+// eslint-disable-next-line security/detect-non-literal-regexp
+const SME_ID_REGEX = new RegExp(KYC_WEBHOOK_VALIDATION.SME_ID_PATTERN);
 
 /**
  * Zod schema for KYC webhook payloads.
@@ -35,8 +38,8 @@ const kycWebhookSchema = z
     /** SME identifier (1–128 chars, alphanumeric/underscore/hyphen). */
     smeId: z
       .string({ invalid_type_error: 'smeId must be a string', required_error: 'smeId is required' })
-      .min(1, { message: 'smeId must not be empty' })
-      .max(128, { message: 'smeId must not exceed 128 characters' })
+      .min(KYC_WEBHOOK_VALIDATION.SME_ID_MIN_LENGTH, { message: 'smeId must not be empty' })
+      .max(KYC_WEBHOOK_VALIDATION.SME_ID_MAX_LENGTH, { message: 'smeId must not exceed 128 characters' })
       .regex(SME_ID_REGEX, {
         message: 'smeId must contain only alphanumeric characters, underscores, and hyphens',
       }),
@@ -44,13 +47,13 @@ const kycWebhookSchema = z
     /** Provider KYC status value (1–50 chars). */
     status: z
       .string({ invalid_type_error: 'status must be a string', required_error: 'status is required' })
-      .min(1, { message: 'status must not be empty' })
-      .max(50, { message: 'status must not exceed 50 characters' }),
+      .min(KYC_WEBHOOK_VALIDATION.STATUS_MIN_LENGTH, { message: 'status must not be empty' })
+      .max(KYC_WEBHOOK_VALIDATION.STATUS_MAX_LENGTH, { message: 'status must not exceed 50 characters' }),
 
     /** Provider record ID (optional, max 255 chars). */
     recordId: z
       .string({ invalid_type_error: 'recordId must be a string' })
-      .max(255, { message: 'recordId must not exceed 255 characters' })
+      .max(KYC_WEBHOOK_VALIDATION.RECORD_ID_MAX_LENGTH, { message: 'recordId must not exceed 255 characters' })
       .optional(),
 
     /** Verification timestamp from the provider (optional, ISO 8601). */
@@ -119,10 +122,50 @@ const kycWebhookListResponseSchema = z.object({
   }),
 });
 
+/**
+ * Zod schema for a quarantined KYC webhook record row.
+ */
+const kycQuarantineRecordSchema = z.object({
+  id: z.string(),
+  tenantId: z.string(),
+  smeId: z.string().nullable().optional(),
+  event: z.string(),
+  payload: z.record(z.unknown()).or(z.array(z.unknown())).or(z.string()).or(z.unknown()),
+  rawPayload: z.string().nullable().optional(),
+  reason: z.string(),
+  errorCode: z.string(),
+  errorDetails: z.unknown().nullable().optional(),
+  actor: z.string().nullable().optional(),
+  ipAddress: z.string().nullable().optional(),
+  userAgent: z.string().nullable().optional(),
+  createdAt: z.union([z.string(), z.date()]),
+  updatedAt: z.union([z.string(), z.date()]),
+});
+
+/**
+ * Zod schema for the full `GET /api/admin/kyc/quarantine` response envelope.
+ */
+const kycQuarantineListResponseSchema = z.object({
+  data: z.array(kycQuarantineRecordSchema),
+  meta: z.object({
+    limit: z.number().int().positive(),
+    hasMore: z.boolean().optional(),
+    nextCursor: z.string().nullable().optional(),
+    offset: z.number().int().nonnegative().optional(),
+    count: z.number().int().nonnegative().optional(),
+  }),
+});
+
+/** Allowed inbound/outbound KYC event types. */
+const ALLOWED_KYC_WEBHOOK_EVENTS = KYC_WEBHOOK_VALIDATION.ALLOWED_EVENTS;
+
 module.exports = {
   kycWebhookSchema,
   kycWebhookRecordSchema,
   kycWebhookListResponseSchema,
+  kycQuarantineRecordSchema,
+  kycQuarantineListResponseSchema,
   parseValidationErrors,
   SME_ID_REGEX,
+  ALLOWED_KYC_WEBHOOK_EVENTS,
 };

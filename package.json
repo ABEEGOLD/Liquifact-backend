@@ -33,7 +33,7 @@
   "type": "commonjs",
   "jest": {
     "testEnvironment": "node",
-    "transformIgnorePatterns": [],
+    "transform": {},
     "testPathIgnorePatterns": [
       "<rootDir>/dist/"
     ],
@@ -107,6 +107,12 @@
         "functions": 95,
         "lines": 95,
         "statements": 95
+      },
+      "src/constants/metricsValidationCodes.js": {
+        "branches": 95,
+        "functions": 95,
+        "lines": 95,
+        "statements": 95
       }
     }
   },
@@ -148,10 +154,20 @@
     "eslint-plugin-security": "^3.0.1",
     "globals": "^16.0.0",
     "jest": "^30.3.0",
-    "redis": "^6.0.1",
+    "redis": "6.1.0",
     "sqlite3": "^6.0.1",
     "supertest": "^7.0.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
+  },
+  "overrides": {
+    "@stacks/common": "7.5.0",
+    "@stacks/encryption": "7.5.0",
+    "@stacks/network": "7.6.0",
+    "@stacks/auth": "7.6.0",
+    "@stacks/bns": "7.6.0",
+    "@stacks/profile": "7.6.0",
+    "@stacks/transactions": "7.6.0",
+    "@stacks/storage": "7.6.0"
   }
 }

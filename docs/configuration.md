@@ -53,7 +53,12 @@ Any violation causes a fast startup failure with a clear, redacted error message
 | `SENTRY_DSN` | URL | Sentry disabled when unset | No | **Secret** | [`src/observability/sentry.js`](../src/observability/sentry.js) |
 | `SENTRY_RELEASE` | string | package version or `liquifact-backend@unknown` | No | No | [`src/observability/sentry.js`](../src/observability/sentry.js) |
 | `SENTRY_ENVIRONMENT` | string | `NODE_ENV` or `development` | No | No | [`src/observability/sentry.js`](../src/observability/sentry.js) |
-| `ESCROW_CACHE_TTL_SECONDS` | integer seconds | `30` | No | No | [`src/config/cache.js`](../src/config/cache.js) |
+| `ESCROW_CACHE_TTL_SECONDS` | integer seconds | `30`, accepted `1..86400` | No | No | [`src/config/cache.js`](../src/config/cache.js) |
+| `ESCROW_CACHE_MAX_ENTRIES` | integer entries | `500`, accepted `1..100000` | No | No | [`src/config/cache.js`](../src/config/cache.js) |
+| `INDEXER_CACHE_TTL_SECONDS` | integer seconds | `10`, accepted `1..86400` | No | No | [`src/config/cache.js`](../src/config/cache.js) |
+| `INDEXER_CACHE_MAX_ENTRIES` | integer entries | `200`, accepted `1..100000` | No | No | [`src/config/cache.js`](../src/config/cache.js) |
+| `INVOICE_STATE_CACHE_TTL_SECONDS` | integer seconds | `30`, accepted `1..86400` | No | No | [`src/config/cache.js`](../src/config/cache.js) |
+| `INVOICE_STATE_CACHE_MAX_ENTRIES` | integer entries | `500`, accepted `1..100000` | No | No | [`src/config/cache.js`](../src/config/cache.js) |
 | `REDIS_ESCROW_CACHE_ENABLED` | boolean string | `false` | No | No | [`src/cache/redis.js`](../src/cache/redis.js) |
 | `REDIS_URL` | Redis URL | Redis cache disabled when unset | No | **Secret** | [`src/cache/redis.js`](../src/cache/redis.js) |
 | `REDIS_ESCROW_CACHE_TTL_SECONDS` | integer seconds | `30`, clamped to `5..300` | No | No | [`src/cache/redis.js`](../src/cache/redis.js) |
@@ -64,7 +69,7 @@ Any violation causes a fast startup failure with a clear, redacted error message
 | `BODY_LIMIT_INVOICE` | size string | `512kb` | No | No | [`src/middleware/bodySizeLimits.js`](../src/middleware/bodySizeLimits.js), [`src/services/storage.js`](../src/services/storage.js) |
 | `INVOICE_FILE_MAX_SIZE` | size string | `5mb` | No | No | [`src/routes/invoiceFile.js`](../src/routes/invoiceFile.js) |
 | `ESCROW_SIGNING_MODE` | enum: `delegated`, `custodial`, `stubbed` | `stubbed` in code; `delegated` in template | No | No | [`src/services/escrowSubmit.js`](../src/services/escrowSubmit.js) |
-| `STELLAR_NETWORK_PASSPHRASE` | string | None in escrow submission | Required outside `stubbed` escrow mode | No | [`src/services/escrowSubmit.js`](../src/services/escrowSubmit.js) |
+| `STELLAR_NETWORK_PASSPHRASE` | string | Derived from `STELLAR_NETWORK` at boot | Optional; if set, must match the selected network | No | [`src/services/escrowSubmit.js`](../src/services/escrowSubmit.js), [`src/config/stellar.js`](../src/config/stellar.js) |
 | `NETWORK_PASSPHRASE` | string | `Test SDF Network ; September 2015` | No | No | [`src/config/index.js`](../src/config/index.js), [`src/config/stellar.js`](../src/config/stellar.js) |
 | `LIQUIFACT_ESCROW_CONTRACT_ID` | Stellar contract ID | None | Required for escrow funding stubs that resolve a contract | No | [`tests/escrowSubmit.stub.test.js`](../tests/escrowSubmit.stub.test.js) |
 | `ESCROW_PLATFORM_ADDRESS` | Stellar public key | None | Required outside `stubbed` escrow mode | No | [`src/services/escrowSubmit.js`](../src/services/escrowSubmit.js) |
@@ -75,7 +80,7 @@ Any violation causes a fast startup failure with a clear, redacted error message
 | `ESCROW_CUSTODIAL_KEY_ID` | KMS key identifier | None | Required only when custodial KMS signing is enabled | **Secret** | [`tests/escrowSubmit.stub.test.js`](../tests/escrowSubmit.stub.test.js) |
 | `ESCROW_DOCUMENT_CUSTODIAL_KEY_ID` | KMS key identifier | None | No | **Secret** | [`.env.example`](../.env.example) |
 | `STELLAR_NETWORK` | enum: `TESTNET`, `MAINNET`, `FUTURENET` | None for README boot validation | Yes, per README Stellar validation | No | [README Stellar validation](../README.md#stellar-network-configuration) |
-| `STELLAR_NETWORK_PASSPHRASE` | string | `Test SDF Network ; September 2015` | No | No | [`src/services/escrowSubmit.js`](../src/services/escrowSubmit.js) |
+| `STELLAR_NETWORK_PASSPHRASE` | string | Derived from `STELLAR_NETWORK` at boot | Optional; if set, must match the selected network | No | [`src/services/escrowSubmit.js`](../src/services/escrowSubmit.js), [`src/config/stellar.js`](../src/config/stellar.js) |
 | `SOROBAN_RPC_URL` | URL | `https://soroban-testnet.stellar.org` in config | Yes, per README Stellar validation | No | [`src/config/index.js`](../src/config/index.js), [`src/services/escrowSubmit.js`](../src/services/escrowSubmit.js), [`src/services/health.js`](../src/services/health.js) |
 | `SOROBAN_MAX_RETRIES` | integer | `3` | No | No | [`src/services/soroban.js`](../src/services/soroban.js) |
 | `SOROBAN_BASE_DELAY` | integer milliseconds | `200` | No | No | [`src/services/soroban.js`](../src/services/soroban.js) |
@@ -93,6 +98,7 @@ Any violation causes a fast startup failure with a clear, redacted error message
 | `STORAGE_IN_MEMORY` | boolean string | unset; auto-on when `NODE_ENV=test` | No | No | [`src/services/storage.js`](../src/services/storage.js) |
 | `STORAGE_HEALTHCHECK_TIMEOUT_MS` | integer milliseconds | `5000` | No | No | [`src/services/storage.js`](../src/services/storage.js) |
 | `METRICS_BEARER_TOKEN` | string | Loopback-only metrics access when unset | Recommended in production | **Secret** | [`src/metrics.js`](../src/metrics.js) |
+| `METRICS_ENABLED` | boolean string | `true` | No | No | [`src/config/index.js`](../src/config/index.js), [`src/metrics.js`](../src/metrics.js) |
 | `API_KEYS` | semicolon-separated JSON objects | Empty registry | Required for API-key clients | **Secret** | [`src/config/apiKeys.js`](../src/config/apiKeys.js), [`src/middleware/apiKeyAuth.js`](../src/middleware/apiKeyAuth.js) |
 | `RATE_LIMIT_WINDOW_MS` | integer milliseconds | `900000` | No | No | [`src/middleware/rateLimit.js`](../src/middleware/rateLimit.js) |
 | `RATE_LIMIT_MAX_REQUESTS` | integer | `100` | No | No | [`src/middleware/rateLimit.js`](../src/middleware/rateLimit.js) |
@@ -102,6 +108,7 @@ Any violation causes a fast startup failure with a clear, redacted error message
 | `RATE_LIMIT_API_KEY_MAX` | integer | `1000` | No | No | [`src/middleware/rateLimit.js`](../src/middleware/rateLimit.js) |
 | `CONFIG_RATE_LIMIT_WINDOW_MS` | integer milliseconds | `60000` | No | No | [`src/middleware/rateLimit.js`](../src/middleware/rateLimit.js) — issue #754 per-client limit on `/api/admin/config` (mounted before `adminStack` so failed auth still counts) |
 | `CONFIG_RATE_LIMIT_MAX` | integer (≥ 1) | `20` | No | No | [`src/middleware/rateLimit.js`](../src/middleware/rateLimit.js) — issue #754 per-client cap, paired with `CONFIG_RATE_LIMIT_WINDOW_MS` |
+| `CONFIG_RUNTIME_ENABLED` | boolean string | `true` | No | No | [`src/config/index.js`](../src/config/index.js) — gates `/api/admin/config` POST / sections endpoints |
 | `WEB_CONCURRENCY` | integer | `1` (single-instance default) | No | No | [`src/middleware/rateLimit.js`](../src/middleware/rateLimit.js) — issues #429 cluster-detection signal |
 | `INVOICE_FRAUD_CEILING` | number > 0 | `10000000` | No | No | [`src/config/verificationThresholds.js`](../src/config/verificationThresholds.js) |
 | `INVOICE_MANUAL_REVIEW_THRESHOLD` | number > 0, `<= INVOICE_FRAUD_CEILING` | `1000000` | No | No | [`src/config/verificationThresholds.js`](../src/config/verificationThresholds.js) |

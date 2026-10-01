@@ -6,6 +6,21 @@
  *  - `POST /metrics/bulk` — batch endpoint accepting an array of
  *    (tenantId, userId) pairs with per-item success/error results
  *
+ * `POST /metrics/bulk` optionally accepts an `Idempotency-Key` header
+ * (issue #745). When present, a retried request with the same key and an
+ * identical body replays the original response instead of re-executing the
+ * batch; the same key reused with a different body returns `409 Conflict`.
+ * Omitting the header preserves the prior, non-idempotent behavior. Keys are
+ * stored in the shared, TTL-bounded `idempotency_keys` table (see
+ * `src/middleware/idempotency.js` and `src/jobs/idempotencyPurge.js`) and are
+ * purged automatically once expired.
+ *
+ * Compatibility contract: response payloads for both endpoints are produced
+ * exclusively through the `src/dto/metrics.js` mappers. Handlers must never
+ * construct metric response shapes inline, so DTO-level invariants (stable
+ * keys, null-vs-undefined handling, numeric coercion) are preserved across
+ * error, empty, and upgrade paths.
+ *
  * @module routes/sme/metrics
  */
 
@@ -16,18 +31,21 @@ const router = express.Router();
 const { authenticateToken } = require('../../middleware/auth');
 const { extractTenant } = require('../../middleware/tenant');
 const { CursorError } = require('../../utils/cursorPagination');
-const metricsService = require('../../services/metricsService');
+const { ValidationError } = require('../../utils/errors');
+const invoiceService = require('../../services/invoiceService');
 const { validateMetricsRequest } = require('../../utils/metricsValidation');
+const optionalIdempotency = require('../../middleware/optionalIdempotency');
 const {
   validateBulkMetricsBody,
   validateGetMetricsQuery,
 } = require('../../schemas/metrics');
 const {
-  toSmeMetricsResponse,
+  toStrictSmeMetricsResponse,
   toSmeMetricsMeta,
   toSmeMetricsApiResponse,
 } = require('../../dto/metrics');
-const { metricsErrorHandler } = require('../../middleware/metricsErrorHandler');
+
+const MAX_BULK_OPERATIONS = 25;
 
 
 /**
@@ -51,24 +69,31 @@ const { metricsErrorHandler } = require('../../middleware/metricsErrorHandler');
  *     security:
  *       - bearerAuth: []
  *     parameters:
- *       - in: header
+ *       - in header
  *         name: x-tenant-id
  *         schema:
  *           type: string
  *         description: Tenant identifier (optional if supplied via JWT claim)
- *       - in: query
+ *       - in query
  *         name: cursor
  *         schema:
  *           type: string
- *         description: Opaque cursor from the previous page's `nextCursor` field.
- *       - in: query
+ *           minLength: 1
+ *           maxLength: 512
+ *         description: |
+ *           Opaque cursor from the previous page's `nextCursor` field.
+ *           Rejected with `400` when empty or longer than 512 characters.
+ *       - in query
  *         name: limit
  *         schema:
  *           type: integer
  *           minimum: 1
  *           maximum: 100
  *           default: 20
- *         description: Items per page (1–100, default 20).
+ *         description: |
+ *            Items per page (1–100, default 20). Must be a bare integer.
+ *           Non-integer (`abc`, `1e5`, `20abc`) or out-of-range (`2`,  `101`)
+ *           values are rejected with `400` rather than silently clamped.
  *     responses:
  *       200:
  *         description: Metrics retrieved successfully
@@ -81,7 +106,7 @@ const { metricsErrorHandler } = require('../../middleware/metricsErrorHandler');
  *                   type: object
  *                   properties:
  *                     open:
- *                       type: integer
+ *                        type: integer
  *                       description: Number of open invoices
  *                     funded:
  *                       type: integer
@@ -101,7 +126,7 @@ const { metricsErrorHandler } = require('../../middleware/metricsErrorHandler');
  *                     version:
  *                       type: string
  *                     invoices:
- *                       type: array
+ *                        type: array
  *                       items:
  *                         type: object
  *                       description: Paginated invoice rows (present when cursor or limit is supplied)
@@ -109,7 +134,7 @@ const { metricsErrorHandler } = require('../../middleware/metricsErrorHandler');
  *                       type: integer
  *                       description: Total matching invoices
  *                     limit:
- *                       type: integer
+ *                        type: integer
  *                       description: Applied page size
  *                     hasMore:
  *                       type: boolean
@@ -125,7 +150,11 @@ const { metricsErrorHandler } = require('../../middleware/metricsErrorHandler');
  *                   type: string
  *                   format: date-time
  *       400:
- *         description: Bad Request — missing tenant context, invalid cursor, or invalid query params
+ *         description: |
+ *           Bad Request — missing tenant context, invalid cursor, or invalid
+ *           query params. Query-validation failures are returned as an RFC 7807
+ *           problem document carrying `code: METRICS_VALIDATION_ERROR` and a
+ *           `fieldErrors` map keyed by parameter name.
  *       401:
  *         description: Unauthorized
  */
@@ -142,19 +171,19 @@ router.get(
       const { userId, tenantId } = ctx;
 
       const rawMetrics = await invoiceService.getSmeInvoiceCounts(tenantId, userId);
-      const data = toSmeMetricsResponse(rawMetrics);
+      // The compatibility DTO remains permissive for existing callers, but
+      // this endpoint must not turn malformed service output into zero counts.
+      // Strict validation forwards a bounded, value-free error to the global
+      // handler, which logs it with request correlation and returns a generic 500.
+      const data = toStrictSmeMetricsResponse(rawMetrics);
 
-      // Prefer schema-validated (and coerced) query values; fall back to raw
-      // query strings to preserve backward compatibility.
+      // Only schema-validated query values are consumed here. `validateGetMetricsQuery`
+      // runs ahead of this handler and rejects the request outright on malformed
+      // input, so an unvalidated raw query string can never reach the store.
       const validatedQuery = req.validatedQuery || {};
-      const cursor =
-        validatedQuery.cursor !== undefined
-          ? validatedQuery.cursor
-          : req.query.cursor;
+      const { cursor } = validatedQuery;
       const limit =
-        validatedQuery.limit !== undefined
-          ? String(validatedQuery.limit)
-          : req.query.limit;
+        validatedQuery.limit !== undefined ? String(validatedQuery.limit) : undefined;
 
       const usePagination = cursor !== undefined || limit !== undefined;
 
@@ -212,6 +241,23 @@ router.get(
  *     tags: [SME]
  *     security:
  *       - bearerAuth: []
+ *     parameters:
+ *       - in: header
+ *         name: Idempotency-Key
+ *         required: false
+ *         schema:
+ *           type: string
+ *           minLength: 8
+ *           maxLength: 128
+ *           pattern: '^[A-Za-z0-9._:-]{8,128}$'
+ *         description: |
+ *           Optional client-generated key (8–128 URL-safe characters).
+ *           When supplied, a retried request with the same key **and** the
+ *           same request body replays the original response instead of
+ *           re-running the batch. Reusing the same key with a different
+ *           body returns `409 Conflict`. Omit the header to opt out of
+ *           idempotency handling entirely (unchanged legacy behavior).
+ *           Keys expire automatically after the configured TTL.
  *     requestBody:
  *       required: true
  *       content:
@@ -219,6 +265,7 @@ router.get(
  *           schema:
  *             type: object
  *             required: [operations]
+ *             additionalProperties: false
  *             properties:
  *               operations:
  *                 type: array
@@ -226,14 +273,17 @@ router.get(
  *                 minItems: 1
  *                 items:
  *                   type: object
+ *                   additionalProperties: false
  *                   required: [tenantId, userId]
  *                   properties:
  *                     tenantId:
- *                       type: string
- *                       maxLength: 128
+ *                        type: string
+ *                        minLength: 1
+ *                        maxLength: 128
  *                     userId:
- *                       type: string
- *                       maxLength: 128
+ *                        type: string
+ *                        minLength: 1
+ *                        maxLength: 128
  *     responses:
  *       200:
  *         description: Bulk metrics results
@@ -247,7 +297,7 @@ router.get(
  *                   items:
  *                     type: object
  *                     properties:
- *                       tenantId:
+ *                        tenantId:
  *                         type: string
  *                       userId:
  *                         type: string
@@ -264,23 +314,36 @@ router.get(
  *                   type: object
  *                   properties:
  *                     total:
- *                       type: integer
+ *                        type: integer
  *                     succeeded:
  *                       type: integer
  *                     failed:
- *                       type: integer
+ *                        type: integer
  *                     timestamp:
  *                       type: string
  *       400:
- *         description: Validation error (empty array, over-cap, missing fields)
- *       401:
- *         description: Unauthorized
+ *         description: |
+ *           Validation error — empty or over-cap `operations` array, missing or
+ *           wrongly-typed `tenantId`/`userId`, an ID longer than 128 characters,
+ *           or any unknown field at either level.
+ *
+ *           Returned as an RFC 7807 problem document with a machine-readable
+ *           `code` of `METRICS_VALIDATION_ERROR`, a `fieldErrors` map of
+ *           human-readable messages, and a parallel `fieldCodes` map of stable
+ *           per-field codes (`FIELD_REQUIRED`, `FIELD_TYPE_INVALID`,
+ *           `FIELD_TOO_LONG`, `ARRAY_TOO_LARGE`, `UNKNOWN_FIELD`, …).
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *       
  */
 router.post(
   '/metrics/bulk',
   authenticateToken,
   extractTenant,
   express.json({ limit: '100kb' }),
+  optionalIdempotency,
   validateBulkMetricsBody,
   async (req, res, next) => {
     try {
@@ -317,7 +380,7 @@ router.post(
             tenantId,
             userId,
             status: 'success',
-            data,
+            data: toSmeMetricsResponse(data, { tenantId, userId }),
             error: null,
           });
           succeeded++;
@@ -347,9 +410,5 @@ router.post(
     }
   }
 );
-
-// Centralised metrics error handler — converts any next(err) into a consistent
-// structured response (issue #973).
-router.use(metricsErrorHandler);
 
 module.exports = router;

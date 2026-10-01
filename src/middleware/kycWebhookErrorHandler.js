@@ -4,49 +4,23 @@
  * @fileoverview Shared error-handling middleware for KYC webhook routes.
  *
  * Intercepts {@link KycWebhookError} instances thrown by route handlers and
- * produces a consistent structured error response envelope:
- *
- *   { error: { code, message, correlation_id, retryable, retry_hint } }
+ * produces an RFC 7807 application/problem+json response via the canonical
+ * problem-detail builder.
  *
  * Non-KycWebhookError values are forwarded to the next error handler in the
  * Express chain.
+ *
+ * Retryability and retry hints are delegated to {@link KycWebhookError#isRetryable}
+ * and {@link KycWebhookError#toRetryHint} — the single authoritative source of
+ * truth for those predicates — rather than duplicating the logic here.
  *
  * @module middleware/kycWebhookErrorHandler
  */
 
 const KycWebhookError = require('../errors/KycWebhookError');
+const formatProblemDetails = require('../utils/problemDetails');
 const logger = require('../logger');
-
-/**
- * HTTP status codes that are considered retryable.
- * @type {Set<number>}
- */
-const RETRYABLE_STATUSES = new Set([429, 503]);
-
-/**
- * Error codes that are explicitly retryable regardless of status.
- * @type {Set<string>}
- */
-const RETRYABLE_CODES = new Set(['missing_secret', 'CIRCUIT_OPEN']);
-
-/**
- * Maps a KycWebhookError to a retry hint string.
- *
- * @param {KycWebhookError} err - The intercepted error.
- * @returns {string} Client-facing retry guidance.
- */
-function resolveRetryHint(err) {
-  if (RETRYABLE_CODES.has(err.code)) {
-    return 'Retry the request in a few moments.';
-  }
-  if (err.status === 429) {
-    return 'Wait for the rate limit window to reset before retrying.';
-  }
-  if (err.status === 503) {
-    return 'Retry the request in a few moments.';
-  }
-  return '';
-}
+const { sanitizeTelemetryString } = require('../utils/telemetryRedaction');
 
 /**
  * Express error-handling middleware for KYC webhook routes.
@@ -54,7 +28,10 @@ function resolveRetryHint(err) {
  * Only handles {@link KycWebhookError} instances; all other errors are
  * forwarded to the next error handler.
  *
- * @param {Error}   req  - Express request.
+ * Emits RFC 7807 application/problem+json responses with type, title, status,
+ * detail, instance, code, retryable, and retry_hint fields.
+ *
+ * @param {KycWebhookError} err - The intercepted error.
  * @param {import('express').Request}   req  - Express request.
  * @param {import('express').Response}  res  - Express response.
  * @param {import('express').NextFunction} next - Next error handler.
@@ -66,14 +43,25 @@ function kycWebhookErrorHandler(err, req, res, next) {
   }
 
   const correlationId = req.correlationId || req.id || 'unknown';
-  const retryable = RETRYABLE_CODES.has(err.code) || RETRYABLE_STATUSES.has(err.status);
 
+  // Delegate to the single-source-of-truth helpers on the error itself.
+  const retryable = err.isRetryable();
+  const retryHint = err.toRetryHint();
+
+  // `err.message` is redacted here as a final, defense-in-depth choke point
+  // for the log line specifically (issue #1200) — the messages that can
+  // carry provider-controlled content are already sanitized at the point
+  // they are constructed (see kycWebhookService.js), so this is a backstop
+  // rather than the only line of defense.  `correlationId` is a value this
+  // service generates itself, never provider input, so it is logged as-is.
+  //
+  // toLogContext() provides structured observability fields (code, status,
+  // smeId, tenantId, requestId) without leaking raw error internals.
   logger.warn(
     {
-      err: err.message,
-      code: err.code,
-      status: err.status,
+      err: sanitizeTelemetryString(err.message),
       correlationId,
+      ...err.toLogContext(),
     },
     'kyc-webhook error',
   );
@@ -81,15 +69,18 @@ function kycWebhookErrorHandler(err, req, res, next) {
   // Store the error code so the post-response metrics hook can read it.
   req._kycErrorCode = err.code;
 
-  res.status(err.status).json({
-    error: {
-      code: err.code,
-      message: err.message,
-      correlation_id: correlationId,
-      retryable,
-      retry_hint: resolveRetryHint(err),
-    },
+  const problem = formatProblemDetails({
+    type: formatProblemDetails.getProblemType(err.status),
+    title: formatProblemDetails.getStandardTitle(err.status),
+    status: err.status,
+    detail: err.message,
+    instance: req.originalUrl || req.url,
+    code: err.code,
+    retryable,
+    retryHint,
   });
+
+  res.status(err.status).type('application/problem+json').json(problem);
 }
 
 module.exports = kycWebhookErrorHandler;

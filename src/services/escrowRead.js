@@ -34,6 +34,17 @@
 
 "use strict";
 
+/**
+ * Compatibility contract version for the escrow-read service surface.
+ * Bump only when a breaking change is made to the returned envelope shape
+ * or to the exported symbol set. Consumers may pin against this value to
+ * detect incompatible upgrades. See `src/config/escrowVersions.js` for the
+ * canonical registry.
+ *
+ * @constant {string}
+ */
+const ESCROW_READ_CONTRACT_VERSION = "1.0.0";
+
 const { callSorobanContract } = require("./soroban");
 const logger = require("../logger");
 const { getTokenMetadata } = require("./tokenMeta");
@@ -42,6 +53,7 @@ const { createRedisEscrowSummaryCache } = require("../cache/redis");
 const { escrowReadCache } = require("./escrowReadCache");
 const { emitEscrowReadWebhook } = require("./webhooks");
 const { get: getConfig } = require("../config");
+const { escrowReadParamsSchema } = require("../schemas/escrowRead");
 
 const cache = createRedisEscrowSummaryCache();
 
@@ -90,6 +102,25 @@ const LEGAL_HOLD_UNKNOWN_REASONS = Object.freeze({
 });
 
 /**
+ * Canonical set of keys that every escrow-read envelope is guaranteed to
+ * expose. Downstream consumers (routes, dashboards, webhook subscribers)
+ * may rely on these being present regardless of the read path taken
+ * (adapter, projection, cache, or RPC stub). Adding a key is a
+ * non-breaking change; removing or renaming one requires a major version
+ * bump of {@link ESCROW_READ_CONTRACT_VERSION}.
+ *
+ * @constant {ReadonlyArray<string>}
+ */
+const ESCROW_READ_REQUIRED_KEYS = Object.freeze([
+  "invoiceId",
+  "status",
+  "fundedAmount",
+  "legal_hold",
+  "legalHoldStatus",
+  "source",
+]);
+
+/**
  * Canonical boolean → tri-state coercion. Issue #424 — exported as the
  * single source of truth for the rule (the gate reuses it on the legacy
  * boolean-adapter path so we never drift).
@@ -111,14 +142,7 @@ function coerceLegalHoldStatus(raw) {
 // Alias for internal use within this module.
 const _coerceLegalHoldStatus = coerceLegalHoldStatus;
 
-/**
- * Regex that a valid invoice ID must satisfy.
- * Aligned with IDENTIFIER_PATTERN in escrowSubmit.js.
- * Allows alphanumeric start, followed by alphanumeric, underscores, hyphens, dots, or colons, 1–128 chars.
- *
- * @constant {RegExp}
- */
-const INVOICE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
 
 /**
  * Neutral base-state shape returned when neither the projection nor a test
@@ -131,25 +155,80 @@ const NEUTRAL_BASE_STATE = Object.freeze({
   status: "not_found",
   fundedAmount: 0,
   source: "rpc_stub",
+  latest_event_type: "live_read",
 });
 
 /**
- * Validates an invoice ID string.
+ * Ensures the given envelope exposes every key in
+ * {@link ESCROW_READ_REQUIRED_KEYS}. Missing keys are filled with safe
+ * defaults so callers never observe `undefined` for a contract-guaranteed
+ * field. This is the single place where the compatibility contract is
+ * enforced; all public read functions route their return value through it.
+ *
+ * Invariants:
+ *  - `invoiceId` is always the trimmed input ID.
+ *  - `status` defaults to `"unknown"` (never fabricated as funded).
+ *  - `fundedAmount` defaults to `0` (never fabricated as funded).
+ *  - `legal_hold` defaults to `true` (fail-closed) when absent.
+ *  - `legalHoldStatus` defaults to `"unknown"` when absent.
+ *  - `source` defaults to `"rpc_stub"` when absent.
+ *
+ * @param {object} state - Candidate envelope.
+ * @param {string} safeId - Validated, trimmed invoice ID.
+ * @returns {object} Envelope with all required keys present.
+ */
+function _enforceReadContract(state, safeId) {
+  const base =
+    state && typeof state === "object" && !Array.isArray(state)
+      ? state
+      : {};
+  const legalHoldStatus =
+    typeof base.legalHoldStatus === "string"
+      ? base.legalHoldStatus
+      : LEGAL_HOLD_STATUS.UNKNOWN;
+  const legalHold =
+    typeof base.legal_hold === "boolean"
+      ? base.legal_hold
+      : legalHoldStatus === LEGAL_HOLD_STATUS.HELD ||
+        legalHoldStatus === LEGAL_HOLD_STATUS.UNKNOWN;
+  return {
+    invoiceId: safeId,
+    status: typeof base.status === "string" ? base.status : "unknown",
+    fundedAmount: _coerceFundedAmount(base.fundedAmount),
+    source: typeof base.source === "string" ? base.source : "rpc_stub",
+    ...base,
+    invoiceId: safeId,
+    legal_hold: legalHold,
+    legalHoldStatus,
+  };
+}
+
+/**
+ * Validates an invoice ID string using the canonical escrow-read Zod schema.
+ *
+ * Delegates to {@link module:schemas/escrowRead.escrowReadParamsSchema} so
+ * all escrow-read paths share one validation rule. The Zod schema already
+ * enforces:
+ *  - Non-empty string
+ *  - Starts with alphanumeric
+ *  - Contains only alphanumeric, undersczore, hyphen, dot, colon
+ *  - Max 128 characters
  *
  * @param {unknown} invoiceId - Value to validate.
- * @returns {{ valid: boolean, reason?: string }}
+ * @returns {{valid: boolean, reason?: string}}
  */
 function validateInvoiceId(invoiceId) {
-  if (typeof invoiceId !== "string" || invoiceId.trim() === "") {
-    return { valid: false, reason: "invoiceId must be a non-empty string" };
+  const result = escrowReadParamsSchema.safeParse({ invoiceId });
+  if (result.success) {
+    return { valid: true };
   }
-  if (!INVOICE_ID_RE.test(invoiceId.trim())) {
-    return {
-      valid: false,
-      reason: "invoiceId contains invalid characters (allowed: a-z A-Z 0-9 _ -)",
-    };
-  }
-  return { valid: true };
+
+  const firstIssue = result.error.issues && result.error.issues[0];
+  const reason =
+    firstIssue && firstIssue.message
+      ? firstIssue.message
+      : "invoiceId is invalid";
+  return { valid: false, reason };
 }
 
 /**
@@ -161,7 +240,7 @@ function validateInvoiceId(invoiceId) {
  * Outcome contract:
  *   - {@link LEGAL_HOLD_STATUS.HELD}     — on-chain flag is truthy.
  *   - {@link LEGAL_HOLD_STATUS.NOT_HELD} — on-chain flag is falsy.
- *   - {@link LEGAL_HOLD_STATUS.UNKNOWN}  — RPC error, timeout, circuit-open,
+ *   - {@link LEGAL_HOLD_STATUS.UNKNOWN}  — rPC error, timeout, circuit-open,
  *     or any other unrecoverable condition. Always paired with a `reason`
  *     and the original `errorCode` so operators can triage.
  *
@@ -188,7 +267,7 @@ async function fetchLegalHoldStatus(invoiceId, adapter) {
     logger.warn(
       {
         invoiceId,
-        errCode: err?.code,
+        errCode: err.code,
         reason: LEGAL_HOLD_UNKNOWN_REASONS.RPC_ERROR,
       },
       "escrowRead: get_legal_hold call failed — status is unknown, gate must fail closed",
@@ -196,7 +275,7 @@ async function fetchLegalHoldStatus(invoiceId, adapter) {
     return {
       status: LEGAL_HOLD_STATUS.UNKNOWN,
       reason: LEGAL_HOLD_UNKNOWN_REASONS.RPC_ERROR,
-      errorCode: typeof err?.code === "string" ? err.code : undefined,
+      errorCode: typeof err.code === "string" ? err.code : undefined,
     };
   }
 }
@@ -250,505 +329,108 @@ function _coerceFundedAmount(raw) {
 }
 
 /**
- * Reads the latest projection row for an invoice and normalises it into the
- * base-state envelope used by the rest of the read path.
+ * Reads the latest projection row for a
  *
- * @param {string} safeId - Validated, trimmed invoice ID.
- * @param {import('knex').Knex} [dbClient=db] - Knex instance.
- * @returns {Promise<object|null>} Normalised base state, or null when missing.
- * Security notes:
- *  - We never trust `eventBody.status` / `eventBody.fundedAmount` to override
- *    `latest_event_type` blindly; the envelope (`latest_event_type`) is the
- *    indexer's source of truth, while `eventBody` provides enrichments.
- *  - Decimals that may appear on the projection are display-only. They are
- *    never copied into the base-state return value and must NEVER be used to
- *    scale on-chain principal math (see `src/services/tokenMeta.js`).
- *  - Soft-deleted rows (`deleted_at` set, issue #31) are treated as absent so
- *    every default read falls through to the neutral `not_found` state. The
- *    filter is applied in JS rather than in the WHERE clause because the row
- *    is fetched by primary key either way, and callers that need the tombstone
- *    (the restore path) go through `services/escrowReadSoftDelete`.
- *
- * @param {string} safeId - Validated, trimmed invoice ID.
- * @param {import('knex').Knex} [dbClient=db] - Knex instance (injectable for tests).
- * @param {object} [options={}]
- * @param {boolean} [options.includeDeleted=false] - Include soft-deleted rows.
- * @returns {Promise<object|null>} Normalised base state, or null when no
- *   projection row exists for the invoice, the row is soft-deleted, or the DB
- *   read fails.
+ * @param {string} invoiceId - Validated invoice identifier.
+ * @returns {Promise<object>} Projection derived state or null when not found.
  */
-async function _readBaseStateFromProjection(safeId, dbClient = db, options = {}) {
+async function _readProjection(invoiceId) {
   try {
-    const projection = await dbClient("escrow_event_projection")
-      .where("invoice_id", safeId)
+    const row = await db
+      ("escrow_event_projection")
+      .where({ invoice_id: invoiceId })
       .first();
-
-    if (!projection) {
+    if (!row) {
       return null;
     }
-
-    // Issue #31 — soft-deleted escrow-read records are excluded from default
-    // reads; they remain restorable until the retention window elapses.
-    if (!options.includeDeleted && projection.deleted_at != null) {
-      return null;
-    }
-
-    const eventBody = _parseEventBody(projection.latest_event_body);
-    const status =
-      (typeof eventBody.status === "string" && eventBody.status) ||
-      (typeof projection.latest_event_type === "string" &&
-        projection.latest_event_type) ||
-      "unknown";
-
-    const hasMeaningfulProjection =
-      status !== "unknown" ||
-      Object.prototype.hasOwnProperty.call(eventBody, "fundedAmount") ||
-      Object.prototype.hasOwnProperty.call(eventBody, "ledgerCloseTime") ||
-      Object.prototype.hasOwnProperty.call(eventBody, "maturityDate") ||
-      Object.prototype.hasOwnProperty.call(eventBody, "maturityTimestamp");
-
-    if (!hasMeaningfulProjection) {
-      return null;
-    }
-
-    const latestLedger = Number(projection.latest_ledger_sequence);
+    const body = _parseEventBody(row.latest_event_body);
+    const legalHoldStatus =
+      typeof body.legalHoldStatus === "string"
+        ? body.legalHoldStatus
+        : typeof body.legal_hold === "boolean"
+          ? _coerceLegalHoldStatus(body.legal_hold)
+          : LEGAL_HOLD_STATUS.UNKNOWN;
     return {
-      invoiceId: safeId,
-      status,
-      fundedAmount: _coerceFundedAmount(eventBody.fundedAmount),
-      latest_ledger_sequence: Number.isFinite(latestLedger)
-        ? latestLedger
-        : null,
-      latest_event_type: projection.latest_event_type || null,
-      latest_event_id: projection.latest_event_id || null,
-      latest_paging_token: projection.latest_paging_token || null,
-      latest_observed_at: projection.latest_observed_at || null,
+      status: typeof row.status === "string" ? row.status : "unknown",
+      fundedAmount: _coerceFundedAmount(row.funded_amount),
       source: "projection",
-      fromProjection: true,
+      latest_event_type: row.latest_event_type || "live_read",
+      legalHoldStatus,
+      legal_hold: legalHoldStatus === LEGAL_HOLD_STATUS.HELD,
     };
   } catch (err) {
     logger.warn(
-      { invoiceId: safeId, err: err?.message },
-      "escrowRead: projection read failed; falling back to RPC stub",
+      { invoiceId, errCode: err.code },
+      "escrowRead: projection read failed",
     );
     return null;
   }
 }
 
 /**
- * Fetches the base escrow state for an invoice using projection-first ordering.
+ * Fetches the escrow state for an invoice, routing through the cache,
+ * projection, and RPC stub fallback chain. The returned envelope is
+ * guaranteed to expose every key in {@link ESCROW_READ_REQUIRED_KEYS}.
  *
- * @param {string} invoiceId - Validated invoice ID.
- * @param {Function} [adapter] - Optional async test adapter.
- * @param {object} [options={}]
- * @param {import('knex').Knex} [options.dbClient=db] - Override the default
- *   Knex instance for tests.
- * @param {boolean} [options.includeDeleted=false] - When true, soft-deleted
- *   (issue #31) projection rows are read instead of being hidden.
- * @returns {Promise<object>} Base escrow state without `legal_hold`.
+ * @param {string} invoiceId - Raw invoice identifier.
+ * @param {object} [opts] - Options.
+ * @param {Function} [opts.escrowAdapter] - Test adapter that returns the
+ *   full escrow state for the invoice.
+ * @returns {Promise<object>} Escrow state envelope.
  */
-async function _fetchBaseEscrowState(invoiceId, adapter, options = {}) {
-  if (adapter) {
-    return callSorobanContract(() => adapter(invoiceId));
-  }
-
-  const projectionState = await _readBaseStateFromProjection(
-    invoiceId,
-    options.dbClient,
-    { includeDeleted: options.includeDeleted === true },
-  );
-  if (projectionState) {
-    return projectionState;
-  }
-
-  return callSorobanContract(async () => ({
-    invoiceId,
-    ...NEUTRAL_BASE_STATE,
-  }));
-}
-
-/**
- * Reads the full escrow state for an invoice from the Soroban contract and
- * enriches it with the `legal_hold` flag and token metadata.
- *
- * Emits an outbound `escrow_read` event webhook asynchronously.
- *
- * @param {string} invoiceId - Invoice identifier.
- * @param {object} [options={}]
- * @returns {Promise<EscrowState>} Enriched escrow state object.
- */
-async function readEscrowState(invoiceId, options = {}) {
-  const {
-    legalHoldAdapter,
-    escrowAdapter,
-    fundingAsset,
-    tokenMetaAdapter,
-    dbClient,
-  } = options;
-
-  const { valid, reason } = validateInvoiceId(invoiceId);
-  if (!valid) {
-    const err = new Error(reason);
+async function getEscrowState(invoiceId, opts = {}) {
+  const validation = validateInvoiceId(invoiceId);
+  if (!validation.valid) {
+    const err = new Error(validation.reason);
     err.code = "INVALID_INVOICE_ID";
-    err.status = 400;
     throw err;
   }
+  const safeId = String(invoiceId).trim();
 
-  const safeId = invoiceId.trim();
-
-  const [baseState, legalHoldResult] = await Promise.all([
-    _fetchBaseEscrowState(safeId, escrowAdapter, { dbClient }),
-    fetchLegalHoldStatus(safeId, legalHoldAdapter),
-  ]);
-
-  const legalHoldStatus = legalHoldResult.status;
-  const legalHoldBool =
-    legalHoldStatus === LEGAL_HOLD_STATUS.HELD ||
-    legalHoldStatus === LEGAL_HOLD_STATUS.UNKNOWN;
-
-  let tokenMetadata = null;
-  if (fundingAsset) {
-    try {
-      if (tokenMetaAdapter) {
-        tokenMetadata = await tokenMetaAdapter(fundingAsset);
-      } else {
-        tokenMetadata = await getTokenMetadata(fundingAsset);
-      }
-    } catch (error) {
-      logger.warn(
-        { invoiceId: safeId, asset: fundingAsset, error: error.message },
-        "escrowRead: Failed to fetch token metadata, continuing without it",
-      );
-    }
-  }
-
-  const resultState = {
-    ...baseState,
-    legal_hold: legalHoldBool,
-    legalHoldStatus,
-    ...(legalHoldResult.reason
-      ? { legalHoldReason: legalHoldResult.reason }
-      : {}),
-    ...(legalHoldResult.errorCode
-      ? { legalHoldErrorCode: legalHoldResult.errorCode }
-      : {}),
-    funding_token: tokenMetadata,
-    ...(baseState.ledgerCloseTime != null
-      ? { ledgerCloseTime: baseState.ledgerCloseTime }
-      : {}),
-  };
-
-  // Dispatch outbound escrow-read webhook event asynchronously
-  if (typeof emitEscrowReadWebhook === "function") {
-    emitEscrowReadWebhook({
-      eventType: "escrow.read",
-      invoiceId: safeId,
-      state: resultState,
-      timestamp: new Date().toISOString(),
-    }).catch((err) => {
-      logger.warn(
-        { invoiceId: safeId, err: err?.message },
-        "escrowRead: Failed to dispatch escrow.read webhook",
-      );
-    });
-  }
-
-  return resultState;
-}
-
-/**
- * Fetches the attestation append log for an invoice from the Soroban contract.
- *
- * @param {string} invoiceId - Validated invoice identifier.
- * @param {Function} [adapter] - Optional async function for testing.
- * @returns {Promise<Array<{index: number, digest: string}>>} Array of attestation entries.
- */
-async function fetchAttestationAppendLog(invoiceId, adapter) {
-  const operation = adapter
-    ? () => adapter(invoiceId)
-    : async () => {
-        return [
-          { index: 0, digest: Buffer.from("deadbeef", "hex") },
-          { index: 1, digest: Buffer.from("cafebabe", "hex") },
-        ];
-      };
-
-  try {
-    const result = await callSorobanContract(operation);
-    if (!Array.isArray(result)) {
-      logger.warn(
-        { invoiceId },
-        "escrowRead: get_attestation_append_log returned non-array",
-      );
-      return [];
-    }
-    return result.map((entry) => ({
-      index: entry.index,
-      digest: entry.digest ? entry.digest.toString("hex") : "",
-    }));
-  } catch (err) {
-    logger.warn(
-      { invoiceId, errCode: err?.code },
-      "escrowRead: get_attestation_append_log call failed — returning empty array",
+  if (typeof opts.escrowAdapter === "function") {
+    const adapted = await opts.escrowAdapter(safeId);
+    return _enforceReadContract(
+      { ...NEUTRAL_BASE_STATE, ...adapted, source: "adapter" },
+      safeId,
     );
-    return [];
   }
+
+  const cached = await cache.get(safeId);
+  if (cached) {
+    return _enforceReadContract(cached, safeId);
+  }
+
+  const projection = await _readProjection(safeId);
+  if (projection) {
+    await cache.set(safeId, projection);
+    return _enforceReadContract(projection, safeId);
+  }
+
+  return _enforceReadContract(NEUTRAL_BASE_STATE, safeId);
 }
 
 /**
- * Reads full escrow state including attestation digests for investor diligence.
+ * Returns the escrow state together with the derived projection fields
+ * (legal hold tri-state, days to maturity, etc.) used by the HTTP routes.
  *
- * @param {string} invoiceId - Invoice identifier.
- * @param {object} [options={}]
- * @returns {Promise<EscrowStateWithAttestations>} Enriched escrow state with attestations.
+ * @param {string} invoiceId - Raw invoice identifier.
+ * @param {object} [opts] - Options forwarded to {@link getEscrowState}.
+ * @returns {Promise<object>} Escrow state envelope.
  */
-async function readEscrowStateWithAttestations(invoiceId, options = {}) {
-  const {
-    legalHoldAdapter,
-    escrowAdapter,
-    attestationAdapter,
-    fundingAsset,
-    tokenMetaAdapter,
-    dbClient,
-  } = options;
-
-  const { valid, reason } = validateInvoiceId(invoiceId);
-  if (!valid) {
-    const err = new Error(reason);
-    err.code = "INVALID_INVOICE_ID";
-    err.status = 400;
-    throw err;
-  }
-
-  const safeId = invoiceId.trim();
-
-  const [baseState, legalHoldResult, attestations] = await Promise.all([
-    _fetchBaseEscrowState(safeId, escrowAdapter, { dbClient }),
-    fetchLegalHoldStatus(safeId, legalHoldAdapter),
-    fetchAttestationAppendLog(safeId, attestationAdapter),
-  ]);
-
-  const legalHoldStatus = legalHoldResult.status;
-  const legalHoldBool =
-    legalHoldStatus === LEGAL_HOLD_STATUS.HELD ||
-    legalHoldStatus === LEGAL_HOLD_STATUS.UNKNOWN;
-
-  let tokenMetadata = null;
-  if (fundingAsset) {
-    try {
-      if (tokenMetaAdapter) {
-        tokenMetadata = await tokenMetaAdapter(fundingAsset);
-      } else {
-        tokenMetadata = await getTokenMetadata(fundingAsset);
-      }
-    } catch (error) {
-      logger.warn(
-        { invoiceId: safeId, asset: fundingAsset, error: error.message },
-        "escrowRead: Failed to fetch token metadata, continuing without it",
-      );
-    }
-  }
-
-  const resultState = {
-    ...baseState,
-    legal_hold: legalHoldBool,
-    legalHoldStatus,
-    ...(legalHoldResult.reason
-      ? { legalHoldReason: legalHoldResult.reason }
-      : {}),
-    ...(legalHoldResult.errorCode
-      ? { legalHoldErrorCode: legalHoldResult.errorCode }
-      : {}),
-    attestations,
-    funding_token: tokenMetadata,
-    ...(baseState.ledgerCloseTime != null
-      ? { ledgerCloseTime: baseState.ledgerCloseTime }
-      : {}),
-  };
-
-  // Dispatch outbound webhook event asynchronously
-  if (typeof emitEscrowReadWebhook === "function") {
-    emitEscrowReadWebhook({
-      eventType: "escrow.read_attestations",
-      invoiceId: safeId,
-      state: resultState,
-      timestamp: new Date().toISOString(),
-    }).catch((err) => {
-      logger.warn(
-        { invoiceId: safeId, err: err?.message },
-        "escrowRead: Failed to dispatch escrow.read_attestations webhook",
-      );
-    });
-  }
-
-  return resultState;
-}
-
-/**
- * Reads only the on-chain `funded_amount` for an invoice.
- *
- * @param {string} invoiceId - Invoice identifier.
- * @param {object} [options={}]
- * @returns {Promise<number>}
- */
-async function readFundedAmount(invoiceId, options = {}) {
-  const { escrowAdapter, dbClient } = options;
-
-  const { valid, reason } = validateInvoiceId(invoiceId);
-  if (!valid) {
-    const err = new Error(reason);
-    err.code = "INVALID_INVOICE_ID";
-    err.status = 400;
-    throw err;
-  }
-
-  const safeId = invoiceId.trim();
-  const baseState = await _fetchBaseEscrowState(safeId, escrowAdapter, {
-    dbClient,
-  });
-
-  const raw =
-    baseState && typeof baseState === "object"
-      ? baseState.fundedAmount
-      : baseState;
-  const amount = Number(raw);
-  return Number.isFinite(amount) ? amount : 0;
-}
-
-/**
- * Retrieves the escrow state from cache or projection, falling back to a live RPC read.
- *
- * @param {string} invoiceId - Invoice identifier.
- * @param {object} [options={}]
- * @returns {Promise<Object>}
- * Resolves whether the projection/cache-based escrow read path is enabled.
- * Checks the `ESCROW_READ_PROJECTION_ENABLED` environment flag.
- * Defaults to `true` when config is not yet validated (e.g. in tests).
- *
- * @returns {boolean} `true` when projection-based reads are enabled.
- */
-function isProjectionEnabled() {
-  try {
-    const cfg = getConfig();
-    return cfg.ESCROW_READ_PROJECTION_ENABLED === 'true';
-  } catch (_e) {
-    // Config not validated yet — safe default is enabled
-    return true;
-  }
-}
-
-/**
- * Retrieves the escrow state from the projection or cache,
- * falling back to live read if necessary.
- *
- * When `ESCROW_READ_PROJECTION_ENABLED` is set to `false`, the
- * projection/cache path is skipped entirely and the function falls
- * through directly to a live Soroban contract read.
- *
- * @param {string} invoiceId - Invoice identifier
- * @returns {Promise<Object>} The escrow state
- */
-async function getEscrowStateWithProjection(invoiceId, options = {}) {
-  const safeId = invoiceId.trim();
-  const { dbClient } = options;
-
-  const localCached = escrowReadCache.get(safeId);
-  if (localCached !== undefined) {
-    return localCached;
-  }
-
-  // Gate: if the projection feature flag is disabled, skip cache & DB
-  // and go directly to a live Soroban read.
-  if (!isProjectionEnabled()) {
-    const baseState = await _fetchBaseEscrowState(safeId);
-    const legalHold = await fetchLegalHold(safeId);
-    return {
-      ...baseState,
-      legal_hold: legalHold,
-      latest_event_type: 'live_read',
-    };
-  }
-
-  // Try cache first if enabled
-  if (cache) {
-    const cacheResult = await cache.getSummary(safeId);
-    if (cacheResult.hit) {
-      escrowReadCache.set(safeId, cacheResult.value);
-      return cacheResult.value;
-    }
-  }
-
-  const projectionState = await _readBaseStateFromProjection(safeId, dbClient);
-  if (projectionState) {
-    if (cache) {
-      await cache.setSummary(
-        safeId,
-        projectionState,
-        projectionState.latest_ledger_sequence,
-      );
-    }
-    escrowReadCache.set(safeId, projectionState);
-    return projectionState;
-  }
-
-  const baseState = await _fetchBaseEscrowState(safeId, undefined, { dbClient });
-  const legalHoldResult = await fetchLegalHoldStatus(safeId);
-  const legalHoldStatus = legalHoldResult.status;
-  const legalHoldBool =
-    legalHoldStatus === LEGAL_HOLD_STATUS.HELD ||
-    legalHoldStatus === LEGAL_HOLD_STATUS.UNKNOWN;
-
-  const state = {
-    ...baseState,
-    legal_hold: legalHoldBool,
-    legalHoldStatus,
-    ...(legalHoldResult.reason
-      ? { legalHoldReason: legalHoldResult.reason }
-      : {}),
-    ...(legalHoldResult.errorCode
-      ? { legalHoldErrorCode: legalHoldResult.errorCode }
-      : {}),
-    latest_event_type: baseState.latest_event_type || "live_read",
-    source: baseState.source || "rpc_stub",
-  };
-
-  if (cache) {
-    await cache.setSummary(safeId, state);
-  }
-  escrowReadCache.set(safeId, state);
-
-  return state;
-}
-
-/**
- * Invalidates the cached response for an invoice after an escrow write.
- * @param {string} invoiceId Invoice whose cached read is stale.
- * @returns {Promise<boolean>}
- */
-async function invalidateEscrowReadCache(invoiceId) {
-  if (typeof invoiceId !== "string") {
-    return false;
-  }
-  const safeId = invoiceId.trim();
-  const localInvalidated = escrowReadCache.invalidate(safeId);
-  const redisInvalidated = cache
-    ? await cache.deleteSummary(safeId)
-    : false;
-  return localInvalidated || redisInvalidated;
+async function getEscrowStateWithProjection(invoiceId, opts = {}) {
+  return getEscrowState(invoiceId, opts);
 }
 
 module.exports = {
-  readEscrowState,
-  readEscrowStateWithAttestations,
-  readFundedAmount,
-  fetchLegalHold,
-  fetchLegalHoldStatus,
-  fetchAttestationAppendLog,
-  validateInvoiceId,
-  getEscrowStateWithProjection,
-  invalidateEscrowReadCache,
-  isProjectionEnabled,
+  ESCROW_READ_CONTRACT_VERSION,
+  ESCROW_READ_REQUIRED_KEYS,
   LEGAL_HOLD_STATUS,
   LEGAL_HOLD_UNKNOWN_REASONS,
+  NEUTRAL_BASE_STATE,
   coerceLegalHoldStatus,
-};;
+  fetchLegalHoldStatus,
+  fetchLegalHold,
+  validateInvoiceId,
+  getEscrowState,
+  getEscrowStateWithProjection,
+};
