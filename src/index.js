@@ -330,7 +330,23 @@ function createApp() {
 
 // Start background workers when running as main module (not in tests)
 if (process.env.NODE_ENV !== 'test' && require.main === module) {
-  startApplication();
+  // Start the idempotency purge worker with a fresh fencing token so that stale
+  // workers from a previous process can no longer write after lease loss.
+  const { startPurgeWorker } = require('./jobs/idempotencyPurge');
+  startPurgeWorker({ fencingToken: crypto.randomUUID() });
+
+  // Start the invoice-state retention purge worker (issue #866) with its own
+  // fencing token, isolated from the idempotency worker's token.
+  const { startPurgeWorker: startInvoiceStatePurgeWorker } = require('./jobs/invoiceStatePurge');
+  startInvoiceStatePurgeWorker({ fencingToken: crypto.randomUUID() });
+
+  // Start the escrow-read tombstone purge worker (issue #31). Hard-deletes
+  // soft-deleted escrow_event_projection rows whose retention window has
+  // elapsed, preventing unbounded tombstone accumulation.
+  const { startPurgeWorker: startEscrowReadPurgeWorker } = require('./jobs/escrowReadPurge');
+  startEscrowReadPurgeWorker();
+
+  startServer();
 }
 
 module.exports = app;
