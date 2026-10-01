@@ -8,6 +8,7 @@ const {
   toConfigSectionsResponseDto,
   fromConfigSectionsResponseDto,
 } = require('../../src/dto/config');
+const { CONFIG_SECTIONS } = require('../../src/schemas/config');
 
 describe('admin config DTO mapping', () => {
   it('round-trips admin config request payloads through the request DTO layer', () => {
@@ -62,5 +63,31 @@ describe('admin config DTO mapping', () => {
     const dto = toConfigSectionsResponseDto(payload.sections);
     expect(dto).toEqual(payload);
     expect(fromConfigSectionsResponseDto(dto)).toEqual(payload);
+  });
+
+  it('rejects malformed request envelopes instead of normalizing them to defaults', () => {
+    expect(() => toAdminConfigRequestDto(null)).toThrow(TypeError);
+    expect(() => toAdminConfigRequestDto({ section: 'cors' })).toThrow(TypeError);
+    expect(() => toAdminConfigRequestDto({ section: 'unknown', config: {} })).toThrow(TypeError);
+    expect(() => toAdminConfigRequestDto({ section: 'cors', config: [] })).toThrow(TypeError);
+    expect(() => toAdminConfigRequestDto({ section: 'cors', config: {}, extra: true })).toThrow(TypeError);
+  });
+
+  it('rejects malformed response envelopes', () => {
+    expect(() => toAdminConfigResponseDto({ section: 'cors', message: '' })).toThrow(TypeError);
+    expect(() => toAdminConfigResponseDto({ section: 'cors', config: {} })).toThrow(TypeError);
+    expect(() => toAdminConfigResponseDto({ section: 'cors', config: {}, message: 1 })).toThrow(TypeError);
+    expect(() => fromAdminConfigResponseDto({ section: 'cors', config: {}, message: '', extra: true })).toThrow(TypeError);
+  });
+
+  it('accepts the full known section boundary and an empty sections list', () => {
+    expect(toConfigSectionsResponseDto(CONFIG_SECTIONS).sections).toEqual(CONFIG_SECTIONS);
+    expect(toConfigSectionsResponseDto([])).toEqual({ sections: [] });
+  });
+
+  it('rejects invalid and duplicate config sections', () => {
+    expect(() => toConfigSectionsResponseDto(['cors', 'unknown'])).toThrow(TypeError);
+    expect(() => toConfigSectionsResponseDto(['cors', 'cors'])).toThrow(TypeError);
+    expect(() => fromConfigSectionsResponseDto({ sections: ['cors'], extra: true })).toThrow(TypeError);
   });
 });

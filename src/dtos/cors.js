@@ -180,6 +180,25 @@ function validateOriginDto(origin, allowedOrigins) {
     return { allowed: true };
   }
 
+  // Reject non-string origins (defensive: header parsing should never
+  // produce these, but callers may pass arbitrary values).
+  if (typeof origin !== 'string') {
+    return {
+      allowed: false,
+      reason: corsConfig.CORS_REJECTION_MESSAGE,
+      errorCode: CORS_INVALID_ORIGIN_CODE,
+    };
+  }
+
+  // Empty string origin is not a valid browser origin → reject.
+  if (origin.length === 0) {
+    return {
+      allowed: false,
+      reason: corsConfig.CORS_REJECTION_MESSAGE,
+      errorCode: CORS_INVALID_ORIGIN_CODE,
+    };
+  }
+
   // Literal "null" origin (sandboxed iframe) → always reject
   if (origin === 'null') {
     return {
@@ -194,7 +213,7 @@ function validateOriginDto(origin, allowedOrigins) {
     return {
       allowed: false,
       reason: corsConfig.CORS_REJECTION_MESSAGE,
-      errorCode: CORS_ORIGIN_NOT_ALLOWED_CODE,
+      errorCode: CORS_EMPTY_ALLOWLIST_CODE,
     };
   }
 
