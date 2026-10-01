@@ -53,7 +53,12 @@ Any violation causes a fast startup failure with a clear, redacted error message
 | `SENTRY_DSN` | URL | Sentry disabled when unset | No | **Secret** | [`src/observability/sentry.js`](../src/observability/sentry.js) |
 | `SENTRY_RELEASE` | string | package version or `liquifact-backend@unknown` | No | No | [`src/observability/sentry.js`](../src/observability/sentry.js) |
 | `SENTRY_ENVIRONMENT` | string | `NODE_ENV` or `development` | No | No | [`src/observability/sentry.js`](../src/observability/sentry.js) |
-| `ESCROW_CACHE_TTL_SECONDS` | integer seconds | `30` | No | No | [`src/config/cache.js`](../src/config/cache.js) |
+| `ESCROW_CACHE_TTL_SECONDS` | integer seconds | `30`, accepted `1..86400` | No | No | [`src/config/cache.js`](../src/config/cache.js) |
+| `ESCROW_CACHE_MAX_ENTRIES` | integer entries | `500`, accepted `1..100000` | No | No | [`src/config/cache.js`](../src/config/cache.js) |
+| `INDEXER_CACHE_TTL_SECONDS` | integer seconds | `10`, accepted `1..86400` | No | No | [`src/config/cache.js`](../src/config/cache.js) |
+| `INDEXER_CACHE_MAX_ENTRIES` | integer entries | `200`, accepted `1..100000` | No | No | [`src/config/cache.js`](../src/config/cache.js) |
+| `INVOICE_STATE_CACHE_TTL_SECONDS` | integer seconds | `30`, accepted `1..86400` | No | No | [`src/config/cache.js`](../src/config/cache.js) |
+| `INVOICE_STATE_CACHE_MAX_ENTRIES` | integer entries | `500`, accepted `1..100000` | No | No | [`src/config/cache.js`](../src/config/cache.js) |
 | `REDIS_ESCROW_CACHE_ENABLED` | boolean string | `false` | No | No | [`src/cache/redis.js`](../src/cache/redis.js) |
 | `REDIS_URL` | Redis URL | Redis cache disabled when unset | No | **Secret** | [`src/cache/redis.js`](../src/cache/redis.js) |
 | `REDIS_ESCROW_CACHE_TTL_SECONDS` | integer seconds | `30`, clamped to `5..300` | No | No | [`src/cache/redis.js`](../src/cache/redis.js) |
