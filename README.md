@@ -431,7 +431,7 @@ Do NOT use custom RPC URLs. The validation will reject any deviation from the ex
 On startup, `src/index.js` calls `validateStellarConfig()` from `src/config/stellar.js`. If the network/RPC combination is invalid, the server fails to start with a clear error message:
 
 ```
-Error: Mismatch: STELLAR_NETWORK=TESTNET requires SOROBAN_RPC_URL="https://soroban-testnet.stellar.org", but got "https://custom-rpc.example.com". This combination would cause on-chain validation failures.
+Error: STELLAR_NETWORK=TESTNET requires SOROBAN_RPC_URL="https://soroban-testnet.stellar.org" (Mismatch).
 ```
 
 ### Security notes
